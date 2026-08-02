@@ -1,7 +1,6 @@
 #include <linux/linkage.h>
 
-
-
+/*
 	.macro __dcache_op_workaround_clean_cache, op, addr
 //alternative_if_not ARM64_WORKAROUND_CLEAN_CACHE
 	dc	\op, \addr
@@ -44,7 +43,7 @@
 	dcache_by_myline_op \op, \domain, \start, \end, \tmp1, \tmp2, \fixup
 	.endm
 
-
+*/
 
 
 
@@ -58,7 +57,7 @@
  *      - start   - kernel start address of region
  *      - end     - kernel end address of region
  */
-
+/*
 	.macro	dcache_line_size, reg, tmp
 	read_ctr	\tmp
 	ubfm		\tmp, \tmp, #16, #19	// cache line size encoding
@@ -71,9 +70,16 @@ mrs	\reg, ctr_el0			// read CTR
 	nop
 	.endm
 
+*/
+
+
+
+//SYM_FUNC_START_LOCAL(__dma_inv_area)
+//SYM_FUNC_START_PI(dcache_inval_poc)
 
 SYM_FUNC_START_LOCAL(__dma_inv_area)
-SYM_FUNC_START_PI(dcache_inval_poc)
+
+
         /* FALLTHROUGH */
 
 /*
@@ -98,9 +104,10 @@ SYM_FUNC_START_PI(dcache_inval_poc)
         b.lo    2b
         dsb     sy
         ret
-SYM_FUNC_END_PI(dcache_inval_poc)
+//SYM_FUNC_END_PI(dcache_inval_poc)
+//SYM_FUNC_END(__dma_inv_area)
 SYM_FUNC_END(__dma_inv_area)
-
+SYM_FUNC_ALIAS(dcache_inval_poc, __dma_inv_area)
 
 
 
@@ -114,8 +121,11 @@ SYM_FUNC_END(__dma_inv_area)
  *	- start   - virtual start address of region
  *	- end     - virtual end address of region
  */
+//SYM_FUNC_START_LOCAL(__dma_clean_area)
+//SYM_FUNC_START_PI(dcache_clean_poc)
+
 SYM_FUNC_START_LOCAL(__dma_clean_area)
-SYM_FUNC_START_PI(dcache_clean_poc)
+
 	/* FALLTHROUGH */
 
 /*
@@ -125,8 +135,10 @@ SYM_FUNC_START_PI(dcache_clean_poc)
  */
 	dcache_by_line_op cvac, sy, x0, x1, x2, x3
 	ret
-SYM_FUNC_END_PI(dcache_clean_poc)
-SYM_FUNC_END(__dma_clean_area)
+//SYM_FUNC_END_PI(dcache_clean_poc)
+//SYM_FUNC_END(__dma_clean_area)
 
+SYM_FUNC_END(__dma_clean_area)
+SYM_FUNC_ALIAS(dcache_clean_poc, __dma_clean_area)
 
 

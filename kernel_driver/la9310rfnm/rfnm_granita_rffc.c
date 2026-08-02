@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 RFNM
+
 #include <linux/irq.h>
 #include <linux/interrupt.h>
 #include <linux/kthread.h>

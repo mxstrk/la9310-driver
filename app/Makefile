@@ -2,7 +2,7 @@
 
 #Add applicatin/exectuable directories here
 
-APP_DIRS := bincreate wdog
+APP_DIRS := bincreate
 
 
 CLEAN_APP_DIRS = $(patsubst %, %_clean, ${APP_DIRS})

@@ -12,9 +12,9 @@ endif
 
 include $(KERNEL_DIR)/.config
 
-obj-y += la9310shiva/
+obj-m += la9310shiva/
 #obj-y += la9310demo/
-obj-y += la9310rfnm/
+obj-m += la9310rfnm/
 
 all:
 	make ARCH=$(ARCH) -C $(KERNEL_DIR) M=$(PWD) modules

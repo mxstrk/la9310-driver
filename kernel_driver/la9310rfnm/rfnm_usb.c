@@ -1,12 +1,5 @@
-// SPDX-License-Identifier: GPL-2.0+
-/*
- * mass_storage.c -- Mass Storage USB Gadget
- *
- * Copyright (C) 2003-2008 Alan Stern
- * Copyright (C) 2009 Samsung Electronics
- *                    Author: Michal Nazarewicz <mina86@mina86.com>
- * All rights reserved.
- */
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 RFNM
 
 
 /*
@@ -27,6 +20,7 @@
 #include <linux/usb/ch9.h>
 #include <linux/module.h>
 #include <linux/io.h>
+#include <linux/device.h>
 #include <linux/rfnm-shared.h>
 
 
@@ -35,8 +29,6 @@
 /* USB functions for functionMask parameter, RFNM function is always enabled*/
 #define FN_MSG 1
 #define FN_NCM 2
-
-
 /*-------------------------------------------------------------------------*/
 USB_GADGET_COMPOSITE_OPTIONS();
 
@@ -136,7 +128,6 @@ static int rfnm_do_config(struct usb_configuration *c)
 	printk("Sending os driver data from callback\n");
 	printk("FunctionMask = %X\n", functionMask);
 
-	
 	f_rfnm = usb_get_function(fi_rfnm);
 	if (IS_ERR(f_rfnm))
 		return PTR_ERR(f_rfnm);
@@ -146,7 +137,7 @@ static int rfnm_do_config(struct usb_configuration *c)
 		goto put_func;
 
 	os_desc_config.interface[0] = f_rfnm;
-	
+
 
 	if (functionMask & FN_MSG)
 	{
@@ -164,11 +155,12 @@ static int rfnm_do_config(struct usb_configuration *c)
 		f_ncm = usb_get_function(fi_ncm);
 		if (IS_ERR(f_ncm))
 			return PTR_ERR(f_ncm);
-
 		ret = usb_add_function(c, f_ncm);
 		if (ret)
 			goto put_func;
 	}	
+
+	
 
 	printk("callback ok\n");
 
@@ -261,24 +253,26 @@ static int rfnm_bind(struct usb_composite_dev *cdev)
 		if (IS_ERR(fi_ncm))
 			return PTR_ERR(fi_ncm);
 	}
-
-	if (functionMask & FN_MSG)
+if (functionMask & FN_MSG)
 	{
 		fi_msg = usb_get_function_instance("mass_storage");
 		if (IS_ERR(fi_msg))
 			return PTR_ERR(fi_msg);
 
+
 		fsg_config_from_params(&msg_config, &msg_mod_data, fsg_num_buffers);
 		msg_opts = fsg_opts_from_func_inst(fi_msg);
-
+		
 		msg_opts->no_configfs = true;
 		status = fsg_common_set_num_buffers(msg_opts->common, fsg_num_buffers);
 		if (status)
 			goto fail;
-
+		
 		status = fsg_common_set_cdev(msg_opts->common, cdev, msg_config.can_stall);
 		if (status)
 			goto fail;
+			
+			
 
 		fsg_common_set_sysfs(msg_opts->common, true);
 		status = fsg_common_create_luns(msg_opts->common, &msg_config);

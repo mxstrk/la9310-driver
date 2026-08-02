@@ -1,5 +1,10 @@
 #Copyright 2017, 2021 NXP
 
+# PWD is inherited from the caller's environment, so `make -C <this dir>` from elsewhere
+# (e.g. the SDK) would point every ${PWD}-derived path at the wrong tree. Pin it here,
+# same as kernel_driver/Makefile already does.
+PWD := $(shell pwd)
+
 CC              = $(CROSS_COMPILE)gcc
 AR              = $(CROSS_COMPILE)ar
 LD              = $(CROSS_COMPILE)ld
@@ -35,7 +40,7 @@ HOST_CFLAGS += ${COMMON_INCLUDES}
 CFLAGS += -Wall -DLA931x_HOST_SW_VERSION="${VERSION_STRING}" -Wno-unused-function -Wno-unused-variable
 
 # Config Tweak handles
-DEBUG ?= 1
+DEBUG ?= 0
 BOOTROM_USE_EDMA ?= 1
 
 export CC LIB_INSTALL_DIR BIN_INSTALL_DIR SCRIPTS_INSTALL_DIR MODULE_INSTALL_DIR \

@@ -1,12 +1,5 @@
-// SPDX-License-Identifier: GPL-2.0+
-/*
- * mass_storage.c -- Mass Storage USB Gadget
- *
- * Copyright (C) 2003-2008 Alan Stern
- * Copyright (C) 2009 Samsung Electronics
- *                    Author: Michal Nazarewicz <mina86@mina86.com>
- * All rights reserved.
- */
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 RFNM
 
 
 /*
@@ -27,6 +20,7 @@
 #include <linux/usb/ch9.h>
 #include <linux/module.h>
 #include <linux/io.h>
+#include <linux/device.h>
 #include <linux/rfnm-shared.h>
 
 #include "drivers/usb/gadget/function/f_mass_storage.h"

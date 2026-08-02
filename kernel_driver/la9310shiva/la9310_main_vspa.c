@@ -31,14 +31,16 @@
 #include <linux/mm.h>
 #include <linux/poll.h>
 #include <linux/dma-mapping.h>
+#include <linux/iopoll.h>
 #include <linux/delay.h>
 #include <linux/list.h>
-#include <linux/delay.h>
 #include <linux/version.h>
 
 #include "la9310_vspa.h"
 #include "la9310_pci.h"
 #include "la9310_base.h"
+#include "la9310_vspa_internal.h"
+#include "la9310_vspa_registry.h"
 
 /* Additional options for checking if Mailbox write to VSP completed */
 #ifdef VSPA_DEBUG
@@ -51,17 +53,10 @@
 #define VSPA_STARTUP_TIMEOUT	(100000)
 #define VSPA_OVERLAY_TIMEOUT	(100)
 
-#define CONTROL_REG_MASK	(~0x000100FF)
-#define CONTROL_PDN_EN		(1<<31)
-#define CONTROL_HOST_MSG_GO	(1<<20 | 1<<21 | 1<<22 | 1<<23)
-#define CONTROL_VCPU_RESET	(1<<16)
-#define CONTROL_DEBUG_MSG_GO	(1<<5)
-#define CONTROL_IPPU_GO		(1<<1)
-#define CONTROL_HOST_GO		(1<<0)
 
 #define DMA_COMP_STAT_SET	0x01
-#define VSPA_DMA_MAX_COUNTER	30
-#define VSPA_DMA_TIMEOUT	100
+#define VSPA_DMA_POLL_US	1000
+#define VSPA_DMA_TIMEOUT_US	100000
 
 static const struct _vspa_sec_info
 {
@@ -89,7 +84,7 @@ vspa_irq_handler(int irq, void *data)
 {
 	struct la9310_dev *la9310_dev = (struct la9310_dev *) data;
 
-	dev_info(la9310_dev->dev, "INFO %s: Interrupt received %d\n",
+	dev_dbg(la9310_dev->dev, "INFO %s: Interrupt received %d\n",
 		 __func__, irq);
 	return IRQ_HANDLED;
 }
@@ -120,7 +115,7 @@ vspa_reset_stats(void *vspa_stats)
 
 }
 
-static int
+int
 la9310_vspa_stats_init(struct la9310_dev *la9310_dev)
 {
 	struct la9310_stats_ops vspa_stats_ops;
@@ -149,13 +144,17 @@ full_state(struct vspa_device *vspadev)
 }
 
 /*This function will program the DMA in polling mode */
-static int
+int
 dma_raw_transmit(struct vspa_device *vspadev, struct vspa_dma_req *dr)
 {
-	int stat_abort;
-	uint32_t counter = 0;
-	volatile int dma_comp_stat, xfr_err, cfg_err;
+	int ret, stat_abort;
+	u32 dma_comp_stat, xfr_err, cfg_err;
 	u32 __iomem *regs = vspadev->regs;
+
+	/* RFNM: the readl_poll_timeout below bypasses vspa_reg_read - refuse outright while the LA9310 link is down (hard reprobe) */
+	if (rfnm_la9310_mmio_fenced()) {
+		return -EBUSY;
+	}
 
 	/* Program the DMA transfer */
 	vspa_reg_write(regs + DMA_DMEM_ADDR_REG_OFFSET, dr->dmem_addr);
@@ -170,19 +169,10 @@ dma_raw_transmit(struct vspa_device *vspadev, struct vspa_dma_req *dr)
 
 	vspa_reg_write(regs + DMA_XFR_CTRL_REG_OFFSET, dr->xfr_ctrl);
 
-	counter = VSPA_DMA_MAX_COUNTER;
-
-	while (!(dma_comp_stat & DMA_COMP_STAT_SET)) {
-		dma_comp_stat =
-			vspa_reg_read(regs + DMA_COMP_STAT_REG_OFFSET);
-		set_current_state(TASK_INTERRUPTIBLE);
-		schedule_timeout(msecs_to_jiffies(VSPA_DMA_TIMEOUT));
-		counter--;
-	}
-
-	set_current_state(TASK_RUNNING);
-
-	if (!counter) {
+	ret = readl_poll_timeout(regs + DMA_COMP_STAT_REG_OFFSET, dma_comp_stat,
+				 dma_comp_stat & DMA_COMP_STAT_SET,
+				 VSPA_DMA_POLL_US, VSPA_DMA_TIMEOUT_US);
+	if (ret) {
 		dev_err(vspadev->dev, "Timeout Error in Raw transmit\n");
 		goto error;
 	}
@@ -203,7 +193,7 @@ error:
 	return -ETIMEDOUT;
 }
 
-static int
+int
 vspa_mem_initialization(struct vspa_device *vspadev)
 {
 	int rc = 0;
@@ -213,7 +203,7 @@ vspa_mem_initialization(struct vspa_device *vspadev)
 	uint32_t axi_align;
 	struct vspa_dma_req z_dma_req;
 	struct la9310_mem_region_info *vspa_dma_region = NULL;
-        dma_addr_t dma_addr;
+       // dma_addr_t dma_addr;
 
 
 	mem_addr = kzalloc(sizeof(uint32_t) * MAX_DMA_TRANSFER, GFP_KERNEL);
@@ -273,20 +263,15 @@ vspa_mem_initialization(struct vspa_device *vspadev)
 		if (count == AXI_TO_IPPU_PRAM || count == AXI_TO_PRAM
 		    || count == AXI_TO_DMEM) {
 
+			/* the staging region is ioremap()ed (uncached
+			 * Device memory) - the memcpy + dma_wmb() IS the
+			 * publish. The old dma_map_page_attrs() here fed
+			 * virt_to_page() an ioremap address (invalid), leaked
+			 * one streaming mapping per chunk, and its returned
+			 * handle was never used (the engine DMAs from
+			 * phys_addr below). Deleted. */
 			memcpy(vspa_dma_region->vaddr,
 			       (const void *) mem_addr, z_dma_req.byte_cnt);
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)
-			 dma_addr=dma_map_page_attrs(&vspadev->pdev->dev,
-				virt_to_page(vspa_dma_region->vaddr),
-				offset_in_page(vspa_dma_region->vaddr), z_dma_req.byte_cnt,
-				(enum dma_data_direction)PCI_DMA_TODEVICE, 0);
-			 dev_info(vspadev->dev,"### vspa_dma_region->vaddr %px dma_addr %px\n",
-					 vspa_dma_region->vaddr,(void*)dma_addr);
-#else
-			pci_map_single(vspadev->pdev, vspa_dma_region->vaddr,
-				z_dma_req.byte_cnt, PCI_DMA_TODEVICE);
-#endif
 			dma_wmb();
 			z_dma_req.axi_addr = vspa_dma_region->phys_addr;
 
@@ -310,7 +295,7 @@ vspa_mem_initialization(struct vspa_device *vspadev)
 
 
 /* To start the vspa core after dma is programmed */
-static int
+int
 startup(struct la9310_dev *la9310_dev)
 {
 	struct vspa_device *vspadev =
@@ -329,23 +314,46 @@ startup(struct la9310_dev *la9310_dev)
 	vspa_sw_version = vspa_reg_read(regs + SWVERSION_REG_OFFSET);
 	ippu_sw_version = vspa_reg_read(regs + IPPU_SWVERSION_REG_OFFSET);
 
-	/* Wait for the 64 bit mailbox bit to be set */
+	/* Wait for the 64 bit mailbox bit to be set.
+	 * adm27e: the M4's hot mailbox poll loop can consume the IN-valid FLAG before
+	 * we see it (warm relaunches always lost this race; fresh boots win only
+	 * because the M4 is still booting; the 5 us userspace tool outruns it) - but
+	 * the DATA register retains the message. Accept Boot Complete from the data
+	 * register when the flag was eaten. */
 
-	for (ctr = VSPA_STARTUP_TIMEOUT; ctr; ctr--) {
-		if (vspa_reg_read(regs + HOST_MBOX_STATUS_REG_OFFSET) &
-		    MBOX_STATUS_IN_64_BIT)
-			break;
-		schedule_timeout(1000);
-	}
-	if (!ctr) {
-		ERR("%d: timeout waiting for Boot Complete msg\n",
-		    vspadev->id);
-		goto startup_fail;
+	{
+		int via_flag = 0;
+
+		for (ctr = VSPA_STARTUP_TIMEOUT; ctr; ctr--) {
+			if (vspa_reg_read(regs + HOST_MBOX_STATUS_REG_OFFSET) &
+			    MBOX_STATUS_IN_64_BIT) {
+				via_flag = 1;
+				break;
+			}
+			if (vspa_reg_read(regs + HOST_IN_64_MSB_REG_OFFSET) == 0xF1000000)
+				break;
+			/* schedule_timeout() without setting a task state
+			 * returns immediately (task stays RUNNING) - the old
+			 * "1000 jiffy" arg never slept and the wait was a hot
+			 * spin bounded only by PCIe read latency. Sleep for
+			 * real: 100000 * ~20 us = ~2 s honest cap. */
+			usleep_range(10, 20);
+		}
+		if (!ctr) {
+			ERR("%d: timeout waiting for Boot Complete msg\n",
+			    vspadev->id);
+			goto startup_fail;
+		}
+		/* receipt discriminator: "status flag" = the M4 mailbox handoff held
+		 * (or the M4 was not competing); "data register" = the fallback caught
+		 * a flag eaten by the M4 (adm27e/adm28) */
+		dev_info(vspadev->dev, "VSPA Boot Complete via %s\n",
+			 via_flag ? "status flag" : "data register");
 	}
 	msb = vspa_reg_read(regs + HOST_IN_64_MSB_REG_OFFSET);
 	lsb = vspa_reg_read(regs + HOST_IN_64_LSB_REG_OFFSET);
 	if (vspadev->debug & DEBUG_STARTUP)
-		dev_info(vspadev->dev,
+		dev_dbg(vspadev->dev,
 			 "Boot Ok Msg: msb = %08X, lsb = %08X\n", msb, lsb);
 
 	/* Check Boot Complete message */
@@ -354,7 +362,7 @@ startup(struct la9310_dev *la9310_dev)
 			vspadev->id);
 		goto startup_fail;
 	} else {
-		dev_info(vspadev->dev,
+		dev_dbg(vspadev->dev,
 			 "Boot Ok Msg Verified: msb = %08X, lsb = %08X\n",
 			 msb, lsb);
 	}
@@ -371,14 +379,17 @@ startup(struct la9310_dev *la9310_dev)
 	vspa_reg_write(regs + HOST_OUT_64_LSB_REG_OFFSET, lsb);
 	vspa_sw_version = vspa_reg_read(regs + SWVERSION_REG_OFFSET);
 	ippu_sw_version = vspa_reg_read(regs + IPPU_SWVERSION_REG_OFFSET);
-	dev_info(vspadev->dev, "SW Version: vspa = %08X, ippu = %08X\n",
+	dev_dbg(vspadev->dev, "SW Version: vspa = %08X, ippu = %08X\n",
 		 vspa_sw_version, ippu_sw_version);
-	/* Wait for the 64 bit mailbox bit to be set */
+	/* Wait for the 64 bit mailbox bit to be set (adm27e: same flag-eaten
+	 * fallback as the Boot Complete wait - the SPM Ack races the M4 too) */
 	for (ctr = VSPA_STARTUP_TIMEOUT; ctr; ctr--) {
 		if (vspa_reg_read(regs + HOST_MBOX_STATUS_REG_OFFSET) &
 		    MBOX_STATUS_IN_64_BIT)
 			break;
-		schedule_timeout(100);
+		if (vspa_reg_read(regs + HOST_IN_64_MSB_REG_OFFSET) == 0xF0700000)
+			break;
+		usleep_range(10, 20);	/* was a no-sleep schedule_timeout (see Boot Complete wait) */
 	}
 	if (!ctr) {
 		ERR("%d: timeout waiting for SPM Ack msg\n", vspadev->id);
@@ -386,10 +397,10 @@ startup(struct la9310_dev *la9310_dev)
 	}
 	msb = vspa_reg_read(regs + HOST_IN_64_MSB_REG_OFFSET);
 	lsb = vspa_reg_read(regs + HOST_IN_64_LSB_REG_OFFSET);
-	dev_info(vspadev->dev, "SPM Ack Msg: msb = %08X, lsb = %08X\n",
+	dev_dbg(vspadev->dev, "SPM Ack Msg: msb = %08X, lsb = %08X\n",
 		 msb, lsb);
 	if (vspadev->debug & DEBUG_STARTUP)
-		dev_info(vspadev->dev,
+		dev_dbg(vspadev->dev,
 			 "SPM Ack Msg: msb = %08X, lsb = %08X\n", msb, lsb);
 	if (msb != 0xF0700000) {
 		ERR("%d: SPM Ack error %08X\n", vspadev->id, msb);
@@ -415,10 +426,10 @@ startup(struct la9310_dev *la9310_dev)
 	}
 
 	if (vspadev->debug & DEBUG_STARTUP) {
-		dev_info(vspadev->dev,
+		dev_dbg(vspadev->dev,
 			 "SW Version: vspa = %08X, ippu = %08X\n",
 			 vspa_sw_version, ippu_sw_version);
-		dev_info(vspadev->dev,
+		dev_dbg(vspadev->dev,
 			"DMA chan: spm %02X, bulk %02X, reply %02X, cmd %02X\n",
 			 vspadev->spm_dma_chan, vspadev->bulk_dma_chan,
 			 vspadev->reply_dma_chan, vspadev->cmd_dma_chan);
@@ -427,7 +438,6 @@ startup(struct la9310_dev *la9310_dev)
 	vspadev->versions.vspa_sw_version = vspa_sw_version;
 	vspadev->versions.ippu_sw_version = ippu_sw_version;
 	vspadev->state = VSPA_STATE_RUNNING_IDLE;
-	init_completion(&vspadev->watchdog_complete);
 	return 0;
 
 startup_fail:
@@ -533,7 +543,7 @@ vspa_fw_dma_write(struct la9310_dev *la9310_dev, struct dma_param *linfo,
 	struct la9310_mem_region_info *vspa_dma_region;
 	struct vspa_device *vspadev =
 		(struct vspa_device *) la9310_dev->vspa_priv;
-        dma_addr_t dma_addr;
+       // dma_addr_t dma_addr;
 
 
 	dev_dbg(la9310_dev->dev, "INFO: %s :DMA_write: mode = %x from = %0llx \
@@ -573,17 +583,9 @@ vspa_fw_dma_write(struct la9310_dev *la9310_dev, struct dma_param *linfo,
 
 		memcpy(vspa_dma_region->vaddr,
 		       (const void *) dma_req.axi_addr, dma_req.byte_cnt);
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)
-		dma_addr=dma_map_page_attrs(&vspadev->pdev->dev,
-				virt_to_page(vspa_dma_region->vaddr),
-				offset_in_page(vspa_dma_region->vaddr), dma_req.byte_cnt,
-				(enum dma_data_direction)PCI_DMA_TODEVICE, 0);
-		dev_info(vspadev->dev,"### vspa_dma_region->vaddr %px dma_addr %px\n",vspa_dma_region->vaddr, (void*)dma_addr);
-#else
-		pci_map_single(vspadev->dev, vspa_dma_region->vaddr,
-				dma_req.byte_cnt, PCI_DMA_TODEVICE);
-#endif
+		/* dma_map_page_attrs() deleted here too - same bogus
+		 * virt_to_page-on-ioremap + per-chunk leak as the zeroise
+		 * path; uncached staging needs only the dma_wmb(). */
 		dma_wmb();
 		dma_req.axi_addr = vspa_dma_region->phys_addr;
 		dev_dbg(la9310_dev->dev, "vspa%d: ctrl %08x, dmem %08x,\
@@ -651,7 +653,7 @@ fw_read_and_load_sections(struct la9310_dev *la9310_dev,
 				get_overlay_section(str,
 						    sec_header[i].sec_name);
 			if (section_name) {
-				dev_info(la9310_dev->dev,
+				dev_dbg(la9310_dev->dev,
 					 "Section Name: %s found\n",
 					 section_name);
 				vspadev->overlay_sec[overlay_link_add].name =
@@ -721,7 +723,7 @@ fw_read_and_load_sections(struct la9310_dev *la9310_dev,
 
 			/*change */
 			if (sec_type == CMDBUFF) {
-				dev_info(la9310_dev->dev,
+				dev_dbg(la9310_dev->dev,
 					 "Load section: cmd_buf_addr 0x%08X, \
 					  cmd_buf_size 0x%08X\n",
 					 section_lma, section_size);
@@ -758,7 +760,7 @@ fw_read_and_load_sections(struct la9310_dev *la9310_dev,
 					"Section header address : %p\n",
 					section_ptr);
 				if (OCRAMVSPA == sec_type) {
-					dev_info(la9310_dev->dev,
+					dev_dbg(la9310_dev->dev,
 						 "Inside condition OCRAMVSPA\n"
 						);
 				} else {
@@ -816,7 +818,7 @@ fw_read_and_load_sections(struct la9310_dev *la9310_dev,
 	return LIBVSPA_ERR_OK;
 }
 
-static int
+int
 la9310_load_vspa_image(struct la9310_dev *la9310_dev, char *vaddr,
 		       int vspa_fw_size)
 {
@@ -840,7 +842,9 @@ la9310_load_vspa_image(struct la9310_dev *la9310_dev, char *vaddr,
 		dev_err(la9310_dev->dev,
 			"Load_elf: bad hdr fh_machine 0x%02X",
 			hd->fh_machine);
-		vfree(vaddr);
+		/* vaddr points into the ioremap()ed staging region
+		 * (la9310_get_dma_region + PTR_ALIGN) - it was never vmalloc
+		 * memory; the old vfree() here corrupted on any bad header. */
 		return -ENOEXEC;
 	}
 
@@ -857,44 +861,6 @@ la9310_load_vspa_image(struct la9310_dev *la9310_dev, char *vaddr,
 	return 0;
 }
 
-/*Overlay DMA Function */
-int
-overlay_initiate(struct device *dev, struct overlay_section overlay_sec)
-{
-	struct la9310_dev *la9310_dev = dev_get_drvdata(dev);
-	struct vspa_device *vspadev = (struct vspa_device *)
-		la9310_dev->vspa_priv;
-	int ret = 0;
-	u32 __iomem *vspa_reg;
-	int overlay_enable_dma = 1;
-
-	overlay_sec.dpram.xfr_ctrl = vspadev->overlay_sec[0].dpram.xfr_ctrl;
-	overlay_sec.dpram.offset = vspadev->overlay_sec[0].dpram.offset;
-
-	ret = vspa_fw_dma_write(la9310_dev, &overlay_sec.dpram, BLOCK,
-				overlay_enable_dma);
-	if (ret < 0) {
-		dev_err(la9310_dev->dev, "Load sections:DMA failed (%d)\n",
-			ret);
-		return ret;
-	}
-
-	vspa_reg =
-		(u32 __iomem *) (la9310_dev->
-				 mem_regions[LA9310_MEM_REGION_TCMU]
-				 .vaddr + 0x400000 +
-				 overlay_sec.dpram.offset);
-
-#ifdef DEBUG_VSPA
-	ret = memcmp((const void *) overlay_sec.dpram.phys,
-		     (const void *) vspa_reg, overlay_sec.dpram.size);
-	if (ret == 0)
-		dev_info(la9310_dev->dev, "Section loading verified\n");
-#endif
-
-	vspadev->overlay_sec_loaded = overlay_sec.name;
-	return 0;
-}
 
 static int
 vspa_get_fw_image(struct la9310_dev *la9310_dev)
@@ -1048,7 +1014,6 @@ vspa_probe(struct la9310_dev *la9310_dev, int vspa_irq_count,
 	vspadev->versions.vspa_sw_version = ~0;
 	vspadev->versions.ippu_sw_version = ~0;
 	vspadev->eld_filename[0] = '\0';
-	vspadev->watchdog_interval_msecs = VSPA_WATCHDOG_INTERVAL_DEFAULT;
 
 	vspadev->poll_mask = VSPA_MSG_ALL;
 
@@ -1069,11 +1034,11 @@ vspa_probe(struct la9310_dev *la9310_dev, int vspa_irq_count,
 
 	/* Make sure all interrupts are disabled */
 	vspa_reg_write(vspadev->regs + IRQEN_REG_OFFSET, 0);
-	dev_info(la9310_dev->dev, "%s: hwver 0x%08x, %d AUs, dmem %d bytes\n",
+	dev_dbg(la9310_dev->dev, "%s: hwver 0x%08x, %d AUs, dmem %d bytes\n",
 			name, vspadev->regs[HWVERSION_REG_OFFSET],
 			hw->arithmetic_units, hw->dmem_bytes);
 
-	dev_info(la9310_dev->dev,
+	dev_dbg(la9310_dev->dev,
 			"INFO:%s : VSPA Loading firmware initiated-\n", __func__);
 
 	vspadev->state = VSPA_STATE_LOADING;
@@ -1084,45 +1049,26 @@ vspa_probe(struct la9310_dev *la9310_dev, int vspa_irq_count,
 		goto err_out;
 	}
 
-	/* Call the LA9310 base APIs to request_firmware */
-	if (vspa_get_fw_image(la9310_dev)) {
-		dev_err(la9310_dev->dev, "ERR %s : Loading VSPA FW failed\n",
-				__func__);
+	/* registry-refactor registry-first bring-up: boot the selected cached image (identity-
+	 * logged, disk-independent - this is the post-hard-reset path too, keeping the
+	 * previous selection). Empty registry (first cold-boot probe): try the legacy
+	 * apm.eld file; if that is absent too the VSPA stays PARKED, non-fatally -
+	 * load_drivers registers images right after insmod and boots via "@boot". */
+	err = rfnm_vspa_probe_boot(la9310_dev);
+	if (err == -ENOENT) {
+		if (vspa_get_fw_image(la9310_dev) == 0 && startup(la9310_dev) == 0) {
+			strcpy(vspadev->eld_filename, VSPA_FW_NAME);
+			rfnm_vspa_boot_tail(la9310_dev);
+			dev_info(la9310_dev->dev, "VSPA booted from legacy %s (registry empty)\n", VSPA_FW_NAME);
+		} else {
+			dev_info(la9310_dev->dev, "VSPA PARKED: registry empty and no legacy %s - register images + @boot, or first client apply boots it\n",
+				 VSPA_FW_NAME);
+		}
+	} else if (err) {
+		dev_err(la9310_dev->dev, "ERR %s: registry VSPA boot failed (%d)\n", __func__, err);
 		err = -EBADRQC;
 		goto err_out;
 	}
-
-	strcpy(vspadev->eld_filename, VSPA_FW_NAME);
-	dev_info(la9310_dev->dev,
-			"INFO:%s :VSPA FW image %s loading finished\n", __func__,
-			vspadev->eld_filename);
-
-	/* Initiate the VSPA_GO to start VSPA booting */
-	if (startup(la9310_dev)) {
-		dev_err(la9310_dev->dev,
-				"ERR %s: VSPA failed to start VSPA\n", __func__);
-		err = -EBADRQC;
-		goto err_out;
-	}
-
-	err = la9310_vspa_stats_init(la9310_dev);
-	if (err < 0) {
-		dev_err(la9310_dev->dev, "ERR: VSPA stats error\n");
-		goto err_out;
-	}
-
-	dev_dbg(la9310_dev->dev, "DBG: Fw image name saved: %s",
-			vspadev->eld_filename);
-
-	/*Clearing the VCPU_TO_HOST MBOXs */
-	vspa_reg_write(vspadev->regs + HOST_FLAGS0_REG_OFFSET, 0xFFFFFFFFUL);
-	vspa_reg_write(vspadev->regs + HOST_FLAGS1_REG_OFFSET, 0xFFFFFFFFUL);
-
-	/*Clearing the mailbox status bits for AVI */
-	vspa_reg_write(vspadev->regs + STATUS_REG_OFFSET, 0xF000);
-
-	dma_wmb();
-	la9310_set_host_ready(la9310_dev, LA9310_HIF_STATUS_VSPA_READY);
 
 	return 0;
 
@@ -1139,7 +1085,6 @@ vspa_remove(struct la9310_dev *la9310_dev)
 		goto out_remove;
 
 	/* shutdown timer cleanly */
-	vspadev->watchdog_interval_msecs = 0;
 	free_irq(vspadev->vspa_irq_no, vspadev);
 
 	kfree(vspadev);

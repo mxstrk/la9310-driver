@@ -104,7 +104,7 @@ static int wdog_register_irq(struct wdog_priv *wdog_pd, struct wdog *wdog)
 			wdog_pd->irq_status_flag = 1;
 
 		} else
-			pr_info("%s WDOG IRQ %d is busy\n",
+			pr_debug("%s WDOG IRQ %d is busy\n",
 				__func__, wdog_pd->irq);
 	} else {
 		pr_err("%s IRQ is invalid\n", __func__);
@@ -140,8 +140,7 @@ static int wdog_gpio_config(struct wdog_priv *wdog_pd)
 	if (ret < 0) {
 		pr_err("%s: Can't configure gpio %d\n", __func__,
 		       wdog_pd->gpio_trst);
-		gpio_free(wdog_pd->gpio_trst);
-		goto err;
+		goto err_trst;
 	}
 
 
@@ -150,20 +149,21 @@ static int wdog_gpio_config(struct wdog_priv *wdog_pd)
 	if (ret) {
 		pr_err("%s: Can't request gpio %d, error: %d\n", __func__,
 		       wdog_pd->gpio_hrst, ret);
-		return ret;
+		goto err_trst;
 	}
 
 	ret = gpio_direction_output(wdog_pd->gpio_hrst, 1);
 	if (ret < 0) {
 		pr_err("%s: Can't configure gpio %d\n", __func__,
 		       wdog_pd->gpio_hrst);
-		gpio_free(wdog_pd->gpio_hrst);
-		goto err;
+		goto err_hrst;
 	}
 
+	return 0;
 
-err:
+err_hrst:
 	gpio_free(wdog_pd->gpio_hrst);
+err_trst:
 	gpio_free(wdog_pd->gpio_trst);
 	return ret;
 }
@@ -172,9 +172,9 @@ static void wdog_reset_modem(struct wdog_priv *wdog_pd, struct wdog *wdog)
 {
 	(void)wdog;
 
-	printk("Watchdog is resetting LA9310 (why?)\n");
+	pr_debug("Watchdog is resetting LA9310\n");
 
-	pr_info("%s: Resetting Modem\n", __func__);
+	pr_debug("%s: Resetting Modem\n", __func__);
 	gpio_set_value_cansleep(wdog_pd->gpio_trst, 0);
 	gpio_set_value_cansleep(wdog_pd->gpio_hrst, 0);
 	mdelay(1);
@@ -347,7 +347,8 @@ static int create_wdog_cdevs(struct wdog_dev *wdog_dev)
 
 	wdog_dev->wdog_dev_major = MAJOR(wdog_dev->wdog_dev_number);
 
-	wdog_dev->wdog_class = class_create(THIS_MODULE, "la9310wdog");
+	wdog_dev->wdog_class = class_create("la9310wdog");
+	//wdog_dev->wdog_class = class_create(THIS_MODULE, "la9310wdog");
 	if (wdog_dev->wdog_class == NULL) {
 		pr_err("%s:Cannot allocate major number\n",
 		       __func__);

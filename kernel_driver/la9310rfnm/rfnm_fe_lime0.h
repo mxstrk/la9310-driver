@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 RFNM
+
 /*
  * lime.h
  *
  *  Created on: Jul 26, 2023
- *      Author: davide
+ *      Author: RFNM
  */
 
 // RFNM_GRANITA0 SCOPE0 HAM0 GRANITALITE0
@@ -17,7 +20,7 @@ void lime0_disable_all_pa(struct rfnm_dgb * dgb_dt);
 void lime0_disable_all_lna(struct rfnm_dgb * dgb_dt);
 
 void lime0_fm_notch(struct rfnm_dgb * dgb_dt, int en);
-void lime0_filter_0_2(struct rfnm_dgb * dgb_dt);
+void lime0_filter_0_70(struct rfnm_dgb * dgb_dt);
 void lime0_filter_2_12(struct rfnm_dgb * dgb_dt);
 void lime0_filter_12_30(struct rfnm_dgb * dgb_dt);
 void lime0_filter_30_60(struct rfnm_dgb * dgb_dt);
@@ -36,6 +39,7 @@ void lime0_loopback(struct rfnm_dgb * dgb_dt);
 void lime0_tx_band(struct rfnm_dgb * dgb_dt, int band);
 void lime0_tx_lpf(struct rfnm_dgb * dgb_dt, int freq);
 int lime0_tx_power(struct rfnm_dgb * dgb_dt, int freq, int target);
+void lime0_tx_force(struct rfnm_dgb * dgb_dt, int mask);
 
 void lime0_ant_tx(struct rfnm_dgb * dgb_dt);
 void lime0_ant_loopback(struct rfnm_dgb * dgb_dt);
@@ -43,6 +47,7 @@ void lime0_ant_through(struct rfnm_dgb * dgb_dt);
 void lime0_ant_embed(struct rfnm_dgb * dgb_dt);
 void lime0_ant_attn_12(struct rfnm_dgb * dgb_dt);
 void lime0_ant_attn_24(struct rfnm_dgb * dgb_dt);
+void lime0_rx_terminated(struct rfnm_dgb * dgb_dt);
 
 
 

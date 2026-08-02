@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 RFNM
+
 #include <linux/irq.h>
 #include <linux/interrupt.h>
 #include <linux/kthread.h>
@@ -64,7 +67,11 @@ void rfnm_gpio_clear(uint8_t dgb_id, uint32_t gpio_map_id) {
 	}
 
 	if(bank == 6) {
-		// la9310
+		// la9310: gpio[6] is the LA9310 GPIO block through the PCIe window - a read-modify-write
+		// while the link is down (hard reprobe) hard-hangs the SoC, so drop the access instead
+		if(rfnm_la9310_mmio_fenced()) {
+			return;
+		}
 		*(gpio[bank] + 2) &= ~(1 << num);
  	} else {
 		// imx
@@ -86,7 +93,10 @@ void rfnm_gpio_set(uint8_t dgb_id, uint32_t gpio_map_id) {
 	}
 
 	if(bank == 6) {
-		// la9310
+		// la9310: see rfnm_gpio_clear - blocked while the LA9310 PCIe link is down
+		if(rfnm_la9310_mmio_fenced()) {
+			return;
+		}
 		*(gpio[bank] + 2) |= (1 << num);
  	} else {
 		// imx
@@ -108,7 +118,10 @@ void rfnm_gpio_output(uint8_t dgb_id, uint32_t gpio_map_id) {
 	}
 
 	if(bank == 6) {
-		// la9310
+		// la9310: see rfnm_gpio_clear - blocked while the LA9310 PCIe link is down
+		if(rfnm_la9310_mmio_fenced()) {
+			return;
+		}
 		*(gpio[bank]) |= (1 << num);
  	} else {
 		// imx

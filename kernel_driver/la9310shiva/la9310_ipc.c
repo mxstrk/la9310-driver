@@ -230,7 +230,7 @@ static long ipc_ioctl(struct file *filp, unsigned int cmd,
 				la9310_dev->mem_regions[LA9310_MEM_REGION_TCML].phys_addr +
 				LA9310_EP_HIF_OFFSET;
 			sys_map.mhif_start.size = LA9310_EP_HIF_SIZE;
-			printk(KERN_INFO "la9310_dev->hif->ipc_regs.ipc_mdata_size: %d\n",
+			pr_debug("la9310_dev->hif->ipc_regs.ipc_mdata_size: %d\n",
 				la9310_dev->hif->ipc_regs.ipc_mdata_size);
 
 			sys_map.hugepg_start.modem_phys =
@@ -364,7 +364,7 @@ la9310_ipc_probe(struct la9310_dev *la9310_dev, int virq_count,
 	struct device *ipc_class_dev = NULL;
 	uint32_t i;
 
-	dev_info(la9310_dev->dev, "Inside %s function K_hif=%lx\n", __func__,
+	dev_dbg(la9310_dev->dev, "Inside %s function K_hif=%lx\n", __func__,
 			sizeof(struct la9310_hif));
 
 	for (i = 0; i < IPC_NR_DEVICES; i++) {
@@ -412,7 +412,7 @@ la9310_ipc_probe(struct la9310_dev *la9310_dev, int virq_count,
 		ret = -EBUSY;
 		goto fail;
 	}
-	dev_info(la9310_dev->dev, "IPC modem is ready!\n");
+	dev_dbg(la9310_dev->dev, "IPC modem is ready!\n");
 
 	ret = ipc_create_cdev(ipc_dev);
 	if (ret)
@@ -423,7 +423,7 @@ la9310_ipc_probe(struct la9310_dev *la9310_dev, int virq_count,
 	in_use_minor[ipc_minor_index] = 1;
 	ipc_dev->minor = ipc_minor_index;
 
-	dev_info(la9310_dev->dev, "Exiting function %s\n", __func__);
+	dev_dbg(la9310_dev->dev, "Exiting function %s\n", __func__);
 	return ret;
 
 fail:
@@ -476,7 +476,7 @@ la9310_ipc_init(void)
 
 	ipc_major = MAJOR(ipc_devnr);
 
-	printk(KERN_INFO "LA9310 IPC driver: major_nr %d, minor %d\n",
+	pr_debug("LA9310 IPC driver: major_nr %d, minor %d\n",
 			ipc_major, ipc_minor);
 
 	return ret;

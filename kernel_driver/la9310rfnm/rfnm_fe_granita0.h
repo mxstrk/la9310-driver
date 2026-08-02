@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 RFNM
+
 /*
  * lime.h
  *
  *  Created on: Jul 26, 2023
- *      Author: davide
+ *      Author: RFNM
  */
 
 #ifndef RFNM_GRANITA0_H_

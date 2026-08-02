@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 RFNM
+
 #include <linux/irq.h>
 #include <linux/interrupt.h>
 #include <linux/kthread.h>
@@ -44,8 +47,6 @@
 #include <linux/rfnm-gpio.h>
 
 #include "rfnm_fe_generic.h"
-
-#include "dtoa.h"
 
 
 
@@ -141,6 +142,8 @@ static int rfnm_breakout_probe(struct spi_device *spi)
 		tx_ch->freq_max = MHZ_TO_HZ(6300);
 		tx_ch->freq_min = MHZ_TO_HZ(0);
 		tx_ch->path_preferred = RFNM_PATH_SMA_B;
+		tx_ch->path_possible[0] = RFNM_PATH_SMA_B;
+		tx_ch->path_possible[1] = RFNM_PATH_NULL;
 		tx_ch->dac_id = 0;
 		rfnm_dgb_reg_tx_ch(dgb_dt, tx_ch, tx_s);
 	}
@@ -148,12 +151,16 @@ static int rfnm_breakout_probe(struct spi_device *spi)
 	rx_ch[0]->freq_max = MHZ_TO_HZ(6300);
 	rx_ch[0]->freq_min = MHZ_TO_HZ(0);
 	rx_ch[0]->path_preferred = RFNM_PATH_SMA_A;
+	rx_ch[0]->path_possible[0] = RFNM_PATH_SMA_A;
+	rx_ch[0]->path_possible[1] = RFNM_PATH_NULL;
 	rx_ch[0]->adc_id = 0;
 	rfnm_dgb_reg_rx_ch(dgb_dt, rx_ch[0], rx_s[0]);
 	
 	rx_ch[1]->freq_max = MHZ_TO_HZ(6300);
 	rx_ch[1]->freq_min = MHZ_TO_HZ(0);
 	rx_ch[1]->path_preferred = RFNM_PATH_SMA_B;
+	rx_ch[1]->path_possible[0] = RFNM_PATH_SMA_B;
+	rx_ch[1]->path_possible[1] = RFNM_PATH_NULL;
 	rx_ch[1]->adc_id = 1;
 	rfnm_dgb_reg_rx_ch(dgb_dt, rx_ch[1], rx_s[1]);
 
@@ -167,13 +174,12 @@ static int rfnm_breakout_probe(struct spi_device *spi)
 	return 0;
 }
 
-static int rfnm_breakout_remove(struct spi_device *spi)
+static void rfnm_breakout_remove(struct spi_device *spi)
 {
 
 	struct rfnm_dgb *dgb_dt;
 	dgb_dt = spi_get_drvdata(spi);
-	rfnm_dgb_unreg(dgb_dt); 
-	return 0;
+	rfnm_dgb_unreg(dgb_dt);
 }
 
 static const struct spi_device_id rfnm_breakout_ids[] = {

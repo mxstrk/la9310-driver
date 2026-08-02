@@ -66,21 +66,20 @@ la9310_show_ep_log(struct device *dev,
 	struct la9310_dev *la9310_dev;
 	struct la9310_ep_log *ep_log;
 	int log_len, i;
-	dma_addr_t dma_addr;
+	//dma_addr_t dma_addr;
 
 	la9310_dev = dev_get_drvdata(dev);
 	ep_log = &la9310_dev->ep_log;
 	log_len = 0;
 
-	dev_info(la9310_dev->dev,
+	dev_dbg(la9310_dev->dev,
 		 "LA9310 log buf dump, vaddr %px, offset %d\n", ep_log->buf,
 		 ep_log->offset);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)
-        dma_addr=dma_map_page_attrs(&la9310_dev->pdev->dev,
-                        virt_to_page(ep_log->buf),
-                        offset_in_page(ep_log->buf), ep_log->len,
-                        (enum dma_data_direction)PCI_DMA_TODEVICE, 0);
-	 dev_info(la9310_dev->dev,"### dep_log->buf %px dma_addr %px\n",ep_log->buf, (void*)dma_addr);
+        dma_map_single(&((struct pci_dev *)la9310_dev->pdev)->dev,
+			ep_log->buf, ep_log->len,
+			DMA_FROM_DEVICE);
+	 //dev_dbg(la9310_dev->dev,"### dep_log->buf %px dma_addr %px\n",ep_log->buf, (void*)dma_addr);
 #else
   	pci_map_single(la9310_dev->pdev, ep_log->buf, ep_log->len,
 		       PCI_DMA_FROMDEVICE);
@@ -95,7 +94,7 @@ la9310_show_ep_log(struct device *dev,
 		}
 	}
 
-	dev_info(la9310_dev->dev, "log len: %d, offset : %d\n", log_len,
+	dev_dbg(la9310_dev->dev, "log len: %d, offset : %d\n", log_len,
 		 ep_log->offset);
 
 	return log_len;
@@ -131,7 +130,7 @@ la9310_reset_ep_log(struct device *dev,
 	memset_io(ep_log->buf, 0, ep_log->len);
 	ep_log->offset = 0;
 
-	dev_info(la9310_dev->dev,
+	dev_dbg(la9310_dev->dev,
 		 "LA9310 log buf reset, vaddr %p, offset %d\n", ep_log->buf,
 		 ep_log->offset);
 out:
@@ -168,7 +167,7 @@ la9310_show_stats(struct device *dev,
 	la9310_dev = dev_get_drvdata(dev);
 	host_stats = &la9310_dev->host_stats;
 
-	dev_info(la9310_dev->dev, "LA9310 host stats dump\n");
+	dev_dbg(la9310_dev->dev, "LA9310 host stats dump\n");
 
 	list_for_each_entry(host_stats, &la9310_dev->host_stats.list, list) {
 		if (stats_len > PAGE_SIZE) {
@@ -213,7 +212,7 @@ la9310_reset_stats(struct device *dev,
 
 	host_stats = &la9310_dev->host_stats;
 
-	dev_info(la9310_dev->dev, "LA9310 host reset stats\n");
+	dev_dbg(la9310_dev->dev, "LA9310 host reset stats\n");
 
 	list_for_each_entry(host_stats, &la9310_dev->host_stats.list, list)
 		host_stats->stats_ops.la9310_reset_stats(host_stats->
@@ -229,7 +228,7 @@ sysfs_del_host_stats_list(struct la9310_dev *la9310_dev)
 	struct la9310_host_stats *host_stats, *host_stats_tmp;
 
 	host_stats = &la9310_dev->host_stats;
-	dev_info(la9310_dev->dev, "LA9310 host stats list delete\n");
+	dev_dbg(la9310_dev->dev, "LA9310 host stats list delete\n");
 
 	list_for_each_entry_safe(host_stats, host_stats_tmp,
 				 &la9310_dev->host_stats.list, list) {
@@ -246,6 +245,12 @@ la9310_show_ep_log_level(struct device *dev,
 	struct debug_log_regs *dbg_log_regs;
 
 	la9310_dev = dev_get_drvdata(dev);
+
+	/* RFNM: hif lives in the LA9310 PCIe window - refuse while the link is down (hard reprobe) */
+	if (rfnm_la9310_mmio_fenced()) {
+		return -EBUSY;
+	}
+
 	dbg_log_regs = &la9310_dev->hif->dbg_log_regs;
 	return snprintf(buf, LA9310_DBG_LOG_MAX_STRLEN,
 			"LA9310 log level - %d\n",
@@ -274,6 +279,11 @@ la9310_set_ep_log_level(struct device *dev,
 		dev_err(la9310_dev->dev,
 			"Invalid level %d, valid [%d - %d]\n", (int) val,
 			LA9310_LOG_LEVEL_ERR, LA9310_LOG_LEVEL_ALL);
+		goto out;
+	}
+
+	/* RFNM: hif lives in the LA9310 PCIe window - drop the write while the link is down (hard reprobe) */
+	if (rfnm_la9310_mmio_fenced()) {
 		goto out;
 	}
 
@@ -334,55 +344,6 @@ show_vspa_info(struct device *dev, struct device_attribute *attr, char *buf)
 }
 
 static ssize_t
-vspa_overlay_get_function(struct device *dev,
-			  struct device_attribute *attr, char *buf)
-{
-	struct la9310_dev *la9310_dev = dev_get_drvdata(dev);
-	struct vspa_device *vspadev = (struct vspa_device *)
-		la9310_dev->vspa_priv;
-	return sprintf(buf, "Currently loaded overlay section: %s\n",
-		       vspadev->overlay_sec_loaded);
-}
-
-static ssize_t
-vspa_overlay_set_function(struct device *dev,
-			  struct device_attribute *attr,
-			  const char *buf, size_t count)
-{
-	struct la9310_dev *la9310_dev = dev_get_drvdata(dev);
-	struct vspa_device *vspadev = (struct vspa_device *)
-		la9310_dev->vspa_priv;
-	char param1[MAX_SECTION_NAME];
-	int i = 0, ret = 0, retval;
-
-	if (count > MAX_SECTION_NAME) {
-		dev_err(la9310_dev->dev, "Section Name is too big\n");
-		return -EINVAL;
-	}
-
-	retval = sscanf(buf, "%s", param1);
-
-	for (i = 0; i < MAX_OVERLAY_SECTIONS; i++) {
-		if (!strncmp(vspadev->overlay_sec[i].name, buf,
-			     strlen(vspadev->overlay_sec[i].name))) {
-			dev_dbg(la9310_dev->dev,
-				"Overlay section identified: %s\n",
-				vspadev->overlay_sec[i].name);
-
-			/*Initiating DMA for overlay section */
-			ret = overlay_initiate(dev, vspadev->overlay_sec[i]);
-			if (ret < 0) {
-				dev_err(la9310_dev->dev,
-					"VSPA Overlay Failed to load\n");
-				return ret;
-			}
-		}
-	}
-
-	return strnlen(buf, count);
-}
-
-static ssize_t
 la9310_iq_samples_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
@@ -413,10 +374,10 @@ la9310_iq_samples_size(struct device *dev,
 	if (!ret) {
 
 		if (iq_samples_cnt  <= LA9310_IQ_SAMPLES_SIZE) {
-			dev_info(la9310_dev->dev, "Set IQ Samples size %d to dump\n",
+			dev_dbg(la9310_dev->dev, "Set IQ Samples size %d to dump\n",
 					iq_samples_cnt);
 		} else {
-			dev_info(la9310_dev->dev, "Invalid IQ Samples size %d\n",
+			dev_dbg(la9310_dev->dev, "Invalid IQ Samples size %d\n",
 					iq_samples_cnt);
 			iq_samples_cnt = 0;
 		}
@@ -434,9 +395,49 @@ static DEVICE_ATTR(target_log_level, S_IWUSR | S_IRUGO,
 static DEVICE_ATTR(target_stats_control, S_IWUSR | S_IRUGO,
 		   la9310_show_stats_control_mask,
 		   la9310_set_stats_control_mask);
+/* registry-refactor/registry-refactor VSPA kernel registry sysfs surface, one verb per node:
+ *   vspa_register (WO): write an fw path (rfnm/vspa/apm-fdx.eld) to register+verify+cache
+ *   vspa_boot     (WO): write "base" to select the minimal STREAMING_BASE image and boot it
+ *   vspa_registry (RO): the registry table with RUNNING/SELECTED markers */
+#include "la9310_vspa_registry.h"
+static ssize_t vspa_register_store(struct device *dev, struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	char name[64];
+	int rc;
+
+	if (count >= sizeof(name))
+		return -ENAMETOOLONG;
+	memcpy(name, buf, count);
+	name[count] = '\0';
+	strim(name);
+	rc = rfnm_vspa_registry_register(name);
+	return rc ? rc : count;
+}
+static DEVICE_ATTR(vspa_register, S_IWUSR, NULL, vspa_register_store);
+
+static ssize_t vspa_boot_store(struct device *dev, struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	int rc;
+
+	if (strncmp(buf, "base", 4) != 0)
+		return -EINVAL;
+	rc = rfnm_vspa_select_for(RFNM_VSPA_CAP_STREAMING_BASE);
+	if (!rc)
+		rc = rfnm_vspa_boot_selected();
+	return rc ? rc : count;
+}
+static DEVICE_ATTR(vspa_boot, S_IWUSR, NULL, vspa_boot_store);
+
+static ssize_t vspa_registry_show(struct device *dev, struct device_attribute *attr,
+				  char *buf)
+{
+	return rfnm_vspa_registry_snapshot(buf, PAGE_SIZE);
+}
+static DEVICE_ATTR(vspa_registry, S_IRUGO, vspa_registry_show, NULL);
+
 static DEVICE_ATTR(vspa_info, S_IRUGO, show_vspa_info, NULL);
-static DEVICE_ATTR(vspa_do_overlay, S_IWUSR | S_IRUGO,
-		   vspa_overlay_get_function, vspa_overlay_set_function);
 static DEVICE_ATTR(iq_samples, S_IWUSR | S_IRUGO,
 		   la9310_iq_samples_show, la9310_iq_samples_size);
 
@@ -446,7 +447,9 @@ static struct attribute *la9310_sysfs_entries[] = {
 	&dev_attr_target_stats_control.attr,
 	&dev_attr_target_stats.attr,
 	&dev_attr_vspa_info.attr,
-	&dev_attr_vspa_do_overlay.attr,
+	&dev_attr_vspa_register.attr,
+	&dev_attr_vspa_boot.attr,
+	&dev_attr_vspa_registry.attr,
 	&dev_attr_iq_samples.attr,
 	NULL
 };
@@ -479,7 +482,7 @@ la9310_init_sysfs(struct la9310_dev *la9310_dev)
 		goto out;
 	}
 	INIT_LIST_HEAD(&la9310_dev->host_stats.list);
-	dev_info(la9310_dev->dev, "Created sysfs group %s\n",
+	dev_dbg(la9310_dev->dev, "Created sysfs group %s\n",
 		 la9310_attribute_group.name);
 out:
 	return rc;

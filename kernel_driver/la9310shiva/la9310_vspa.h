@@ -175,7 +175,6 @@ struct vspa_event_read {
 
 /* Set Watchdog interval */
 #define VSPA_IOC_WATCHDOG_INT	_IO(VSPA_MAGIC_NUM, 10)
-#define VSPA_WATCHDOG_INTERVAL_DEFAULT	 (1000)
 #define VSPA_WATCHDOG_INTERVAL_MIN	  (100)
 #define VSPA_WATCHDOG_INTERVAL_MAX	(60000)
 
@@ -667,14 +666,11 @@ struct vspa_device {
 
 	uint8_t		legacy_cmd_dma_chan;
 	char		eld_filename[VSPA_MAX_ELD_FILENAME];
+	int		rfnm_stats_ready;	/* registry-refactor: stats_init once per probe (registry re-boots skip it) */
 	struct vspa_versions versions;
 	struct vspa_hardware hardware;
 
 	/* Watchdog */
-	struct timer_list watchdog_timer;
-	uint32_t	watchdog_interval_msecs;
-	uint32_t	watchdog_value;
-	struct completion watchdog_complete;
 
 	/* IRQ handling */
 /* TODO	spinlock_t irq_lock; */
@@ -703,15 +699,21 @@ extern const struct attribute_group attr_group;
 
 static inline void vspa_reg_write(void __iomem *addr, u32 val)
 {
+	/* RFNM: VSPA regs live in the LA9310 PCIe window - drop the write while the link is down (hard reprobe) */
+	if (rfnm_la9310_mmio_fenced()) {
+		return;
+	}
 	return iowrite32(val, addr);
 }
 
 static inline unsigned int vspa_reg_read(void __iomem *addr)
 {
+	/* RFNM: VSPA regs live in the LA9310 PCIe window - return poison while the link is down (hard reprobe) */
+	if (rfnm_la9310_mmio_fenced()) {
+		return 0;
+	}
 	return ioread32(addr);
 }
 
 int full_state(struct vspa_device *vspadev);
-int overlay_initiate(struct device *dev, struct overlay_section
-		     overlay_sec);
 #endif /* _VSPA_H */

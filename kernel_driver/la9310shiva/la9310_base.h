@@ -19,8 +19,9 @@
 /*Boot HandShake timeout in jiffies and retry count */
 #define LA9310_HOST_BOOT_HSHAKE_TIMEOUT		100
 #define LA9310_HOST_BOOT_HSHAKE_RETRIES		60
-#define LA9310_IPC_INIT_WAIT_TIMEOUT		100
-#define LA9310_IPC_INIT_WAIT_RETRIES		50
+#define LA9310_HOST_BOOT_POLL_INTERVAL		5
+#define LA9310_IPC_INIT_WAIT_TIMEOUT		5
+#define LA9310_IPC_INIT_WAIT_RETRIES		1000
 #define NXP_ERRATUM_A008822	       1
 
 /*Enable the multiple MSIs support */
@@ -359,9 +360,6 @@ int vspa_remove(struct la9310_dev *la9310_dev);
 int la9310_test_probe(struct la9310_dev *la9310_dev, int virq_count,
 		      struct virq_evt_map *virq_map);
 int la9310_test_remove(struct la9310_dev *la9310_dev);
-int la9310_v2h_probe(struct la9310_dev *la9310_dev, int virq_count,
-		     struct virq_evt_map *virq_map);
-int la9310_v2h_remove(struct la9310_dev *la9310_dev);
 
 extern int la9310_subdrv_mod_init(void);
 extern void la9310_subdrv_mod_exit(void);
@@ -398,8 +396,6 @@ int la9310_create_outbound_msi(struct la9310_dev *la9310_dev);
 void la9310_create_ipc_hugepage_outbound(struct la9310_dev *la9310_dev,
 		uint64_t phys_addr, uint32_t size);
 extern int la9310_get_msi_irq(struct la9310_dev *, enum la9310_msi_id);
-int v2h_callback_test_init(struct la9310_dev *la9310_dev);
-int v2h_callback_test_deinit(void);
 struct la9310_dev *get_la9310_dev_byname(const char *name);
 void la9310_init_ep_pcie_allocator(struct la9310_dev *la9310_dev);
 uint32_t la9310_alloc_ep_pcie_addr(struct la9310_dev *la9310_dev,

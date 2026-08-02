@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 RFNM
+
 #ifndef RFNM_FE_GENERIC_H_
 #define RFNM_FE_GENERIC_H_
 

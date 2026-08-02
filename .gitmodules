@@ -3,4 +3,4 @@
 	url = https://github.com/nxp-qoriq/la93xx_firmware.git
 [submodule "LimeSuiteNG"]
 	path = LimeSuiteNG
-	url = https://github.com/ehntoo/LimeSuiteNG.git
+	url = https://github.com/rfnm/LimeSuiteNG.git

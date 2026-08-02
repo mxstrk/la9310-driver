@@ -1,6 +1,5 @@
-/* SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0)
- * Copyright 2017, 2021-2022 NXP
- */
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 RFNM
 
 #ifndef __LA9310_RFNM_LALIB_H__
 #define __LA9310_RFNM_LALIB_H__
@@ -84,6 +83,25 @@ struct rfdevice {
 
 
 #pragma pack(pop)
+
+void rfnm_la9310_quiesce(void);
+void rfnm_la9310_stream_regate(void);
+int rfnm_la9310_tdd(uint32_t period_chunks, uint32_t duty_chunks);
+
+// TX health snapshot: walker counters from the TCM request ring + the AXIQ/gate
+// registers docs-5q proved host-visible. 0xffffffff fields = MMIO fenced / ring unmapped.
+struct rfnm_tx_health {
+	uint32_t txn_prod;
+	uint32_t txn_cons;
+	uint32_t txn_executed;
+	uint32_t txn_missed;
+	uint32_t txn_rejected;
+	uint32_t txn_qs_stuck;
+	uint32_t axiq_sr1;	// GPIN1: TX0 nibble bits[19:16] = {ERROVER, ERRUNDER, NOTFULL, ENABLED}
+	uint32_t axiq_cr3;	// GPOUT7: bit0 = TX0 fifo enable command
+	uint32_t c11_sc;	// TX_ALLOWED comparator SC readback: bit31 = live output level
+};
+void rfnm_la9310_tx_health(struct rfnm_tx_health *h);
 
 #define LA9310_RF_SW_CMD_MSG_UNIT_BIT    ( 1 )
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 RFNM
+
 #include <linux/irq.h>
 #include <linux/interrupt.h>
 #include <linux/kthread.h>
@@ -221,7 +224,7 @@ int rfnm_tx_ch_set(struct rfnm_dgb *dgb_dt, struct rfnm_api_tx_ch * tx_ch) {
 
 
 
-	if(tx_ch->path != RFNM_PATH_LOOPBACK && tx_ch->enable != RFNM_CH_ON_TDD) {
+	if(tx_ch->path != RFNM_PATH_LOOPBACK && tx_ch->enable != RFNM_CH_RF_ON_TDD) {
 		ret = SiAPIPowerUpTX(SiCoreChar[dgb_dt->dgb_id], SIAPI_PATH_B, HZ_TO_KHZ(tx_ch->freq), parse_granita_iq_lpf(tx_ch->rfic_lpf_bw));
 		if(ret) {
 			printk("SiAPIPowerUpTX wouldn't return nice things\n");
@@ -236,7 +239,7 @@ int rfnm_tx_ch_set(struct rfnm_dgb *dgb_dt, struct rfnm_api_tx_ch * tx_ch) {
 			goto fail;
 		}
 	}
-	else if(tx_ch->enable != RFNM_CH_ON_TDD) {
+	else if(tx_ch->enable != RFNM_CH_RF_ON_TDD) {
 		// loopback rx frequency is the first rx channel with rx loopback mode set
 		long rx_freq = 0;
 		for(int q = 0; q < 4; q++) {
@@ -274,11 +277,11 @@ int rfnm_tx_ch_set(struct rfnm_dgb *dgb_dt, struct rfnm_api_tx_ch * tx_ch) {
 	}
 
 
-	if(tx_ch->enable == RFNM_CH_ON_TDD) {
+	if(tx_ch->enable == RFNM_CH_RF_ON_TDD) {
 		memcpy(&dgb_dt->fe_tdd[RFNM_TX], &dgb_dt->fe, sizeof(struct fe_s));	
 
 		for(int i = 0; i < 2; i++) {
-			if(dgb_dt->rx_s[i]->enable == RFNM_CH_ON_TDD) {
+			if(dgb_dt->rx_s[i]->enable == RFNM_CH_RF_ON_TDD) {
 				rfnm_dgb_en_tdd(dgb_dt, tx_ch, dgb_dt->rx_s[i]);
 				rfnm_granita_tdd(dgb_dt, tx_ch, dgb_dt->rx_s[i]);
 				break;
@@ -442,7 +445,7 @@ int rfnm_rx_ch_set(struct rfnm_dgb *dgb_dt, struct rfnm_api_rx_ch * rx_ch) {
 		gr_api_id = SIAPI_PATH_B;
 	}
 
-	if(dgb_dt->rx_s[!rx_ch->dgb_ch_id]->enable == RFNM_CH_ON) {
+	if(dgb_dt->rx_s[!rx_ch->dgb_ch_id]->enable == RFNM_CH_RF_ON) {
 		if(rx_ch->dgb_ch_id == 0) {
 			gr_api_id |= SIAPI_PATH_B;
 		} else {
@@ -519,7 +522,7 @@ int rfnm_rx_ch_set(struct rfnm_dgb *dgb_dt, struct rfnm_api_rx_ch * rx_ch) {
 	rfnm_fe_load_latches(dgb_dt);
 	rfnm_fe_trigger_latches(dgb_dt);
 
-	if(rx_ch->path != RFNM_PATH_LOOPBACK && rx_ch->enable != RFNM_CH_ON_TDD) {
+	if(rx_ch->path != RFNM_PATH_LOOPBACK && rx_ch->enable != RFNM_CH_RF_ON_TDD) {
 		// TX command takes care of RX init when in loopback mode
 		ret = SiAPIPowerUpRX(SiCoreChar[dgb_dt->dgb_id], gr_api_id, HZ_TO_KHZ(freq), parse_granita_iq_lpf(rx_ch->rfic_lpf_bw));
 		if(ret) {
@@ -543,12 +546,12 @@ int rfnm_rx_ch_set(struct rfnm_dgb *dgb_dt, struct rfnm_api_rx_ch * rx_ch) {
 		}
 	}
 
-	if(rx_ch->enable == RFNM_CH_ON_TDD) {
+	if(rx_ch->enable == RFNM_CH_RF_ON_TDD) {
 		// go for maximum attenuation on tx path
 		granita0_tx_power(dgb_dt, 1000, -100, 0);
 		
 		memcpy(&dgb_dt->fe_tdd[RFNM_RX], &dgb_dt->fe, sizeof(struct fe_s));	
-		if(dgb_dt->tx_s[0]->enable == RFNM_CH_ON_TDD) {
+		if(dgb_dt->tx_s[0]->enable == RFNM_CH_RF_ON_TDD) {
 			rfnm_dgb_en_tdd(dgb_dt, dgb_dt->tx_s[0], rx_ch);
 			rfnm_granita_tdd(dgb_dt, dgb_dt->tx_s[0], rx_ch);
 		}
@@ -556,6 +559,7 @@ int rfnm_rx_ch_set(struct rfnm_dgb *dgb_dt, struct rfnm_api_rx_ch * rx_ch) {
 
 	memcpy(dgb_dt->rx_s[rx_ch->dgb_ch_id], dgb_dt->rx_ch[rx_ch->dgb_ch_id], sizeof(struct rfnm_api_rx_ch));	
 
+	//printk("path %d gr_api_id %x freq %ld gain %d retcode %d\n", rx_ch->dgb_ch_id, gr_api_id, freq, rx_ch->gain, ecode);
 	return 0;
 
 	
@@ -735,8 +739,8 @@ static int rfnm_granita_probe(struct spi_device *spi)
 	rx_ch[1]->path_possible[1] = RFNM_PATH_SMA_A;
 	rx_ch[1]->path_possible[2] = RFNM_PATH_EMBED_ANT;
 	rx_ch[1]->path_possible[3] = RFNM_PATH_NULL;
-	rx_ch[0]->gain_range.min = -40;
-	rx_ch[0]->gain_range.max = 60;
+	rx_ch[1]->gain_range.min = -40;
+	rx_ch[1]->gain_range.max = 60;
 
 	rx_ch[1]->adc_id = 0;
 	rfnm_dgb_reg_rx_ch(dgb_dt, rx_ch[1], rx_s[1]);
@@ -756,7 +760,7 @@ static int rfnm_granita_probe(struct spi_device *spi)
 	return 0;
 }
 
-static int rfnm_granita_remove(struct spi_device *spi)
+static void rfnm_granita_remove(struct spi_device *spi)
 {
 	struct rfnm_dgb *dgb_dt;
 	dgb_dt = spi_get_drvdata(spi);
@@ -768,8 +772,6 @@ static int rfnm_granita_remove(struct spi_device *spi)
 	rfnm_dgb_unreg(dgb_dt); 
 
 	put_device(si5510_i2c_dev);
-
-	return 0;
 }
 
 static const struct spi_device_id rfnm_granita_ids[] = {

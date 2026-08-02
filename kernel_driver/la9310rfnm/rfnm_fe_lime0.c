@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 RFNM
+
 
 #include <linux/slab.h>
 #include <linux/kernel.h>
@@ -33,7 +36,7 @@ void lime0_fm_notch(struct rfnm_dgb * dgb_dt, int en) {
 	}
 }
 
-void lime0_filter_0_2(struct rfnm_dgb * dgb_dt) {
+void lime0_filter_0_70(struct rfnm_dgb * dgb_dt) {
 	//printk("lime0_filter_0_2\n");
 	rfnm_fe_srb(dgb_dt, RFNM_LIME0_FA1, 0);
 	
@@ -292,7 +295,7 @@ void lime0_tx_lpf(struct rfnm_dgb * dgb_dt, int freq) {
 		rfnm_fe_srb(dgb_dt, RFNM_LIME0_TFA, 0);
 		rfnm_fe_srb(dgb_dt, RFNM_LIME0_TFB1, 0);
 		rfnm_fe_srb(dgb_dt, RFNM_LIME0_TFB2, 0);		
-	} else if(freq < 1500) {
+	} else if(freq < 1600) {
 		rfnm_fe_srb(dgb_dt, RFNM_LIME0_TFA, 1);
 		rfnm_fe_srb(dgb_dt, RFNM_LIME0_TFB1, 1);
 		rfnm_fe_srb(dgb_dt, RFNM_LIME0_TFB2, 1);
@@ -406,7 +409,7 @@ int lime0_tx_power(struct rfnm_dgb * dgb_dt, int freq, int target) {
 		rfnm_fe_srb(dgb_dt, RFNM_LIME0_T6O, 0);
 	}
 	
-	//printk("target pwr %d vs cur %d", target, cur_power);
+	//printk("target pwr %d vs cur %d\n", target, cur_power);
 	if(target > cur_power) {
 		return abs(target - cur_power);
 	} else {
@@ -414,6 +417,78 @@ int lime0_tx_power(struct rfnm_dgb * dgb_dt, int freq, int target) {
 	}
 }
 
+// DEBUG DOOR (TX cal model): force the switched TX FE elements
+// directly, bypassing the s-ladder policy, so each element can be measured in isolation.
+// mask bits: 0=PA1, 1=PA2, 2=T24, 3=T12, 4=T6 (set = element IN). Same latch conventions
+// as lime0_tx_power above; caller owns load_order/load_latches/trigger as usual.
+void lime0_tx_force(struct rfnm_dgb * dgb_dt, int mask) {
+	if(mask & 1) {
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_TL1I, 0);
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_TL1O, 1);
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_PA_S1, 0);
+	} else {
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_TL1I, 1);
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_TL1O, 0);
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_PA_S1, 1);
+	}
+	if(mask & 2) {
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_TL2I, 0);
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_TL2O, 1);
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_PA_S2, 0);
+	} else {
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_TL2I, 1);
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_TL2O, 0);
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_PA_S2, 1);
+	}
+	if(mask & 4) {
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_T24I, 0);
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_T24O, 1);
+	} else {
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_T24I, 1);
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_T24O, 0);
+	}
+	if(mask & 8) {
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_T12I, 0);
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_T12O, 1);
+	} else {
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_T12I, 1);
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_T12O, 0);
+	}
+	if(mask & 16) {
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_T6I, 0);
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_T6O, 1);
+	} else {
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_T6I, 1);
+		rfnm_fe_srb(dgb_dt, RFNM_LIME0_T6O, 0);
+	}
+}
+
+
+/* RX input TERMINATED — the RFNM_PATH_TERMINATED route (flatness rig / receiver-only floor).
+ * Netlist truth (RFNMLime.NET.EDF): this is
+ * lime0_ant_attn_12's proven state with ONE bit changed — ANT_A=0 — so the 12 dB pad
+ * route stays selected into RX (AO=(0,1), ANT_E=0) while SW4 parks the SMA away from
+ * the pad-chain input instead of feeding it: the RX line sees the pads' ground legs (a
+ * resistive termination), the SMA sits on a deselected RX-selector throw, the embedded
+ * antenna is a deselected SW36 throw, TX off-path (ANT_T=0). Do NOT guess un-proven
+ * switch codes here: an earlier first cut (AO=(1,1), AI=(1,0), ANT_A=1 — "R24 shunt"
+ * misread) kept the SMA feeding the pads into RX (~12 dB antenna-like behavior).
+ * Verified on hardware (broadcast-FM witness, A-B-A): the route applies/streams and the
+ * latches demonstrably move, but VHF path deltas are PICKUP-limited on the unshielded
+ * FE (embed -33.6 vs terminated -39.2 dBFS — at 95 MHz the embed antenna is as
+ * electrically small as the RX traces), so the netlist 50 dB is UNVERIFIED; the
+ * discriminating GHz measurement (real-antenna regime) needs a DCOFF-healthy board (the
+ * bring-up lottery can rail the DC at high LO). Terminated RX is a test state: concurrent TX is
+ * unsupported by definition. */
+void lime0_rx_terminated(struct rfnm_dgb * dgb_dt) {
+	rfnm_fe_srb(dgb_dt, RFNM_LIME0_ANT_A, 0);
+	rfnm_fe_srb(dgb_dt, RFNM_LIME0_AI1, 1);
+	rfnm_fe_srb(dgb_dt, RFNM_LIME0_AI2, 1);
+	rfnm_fe_srb(dgb_dt, RFNM_LIME0_AO1, 0);
+	rfnm_fe_srb(dgb_dt, RFNM_LIME0_AO2, 1);
+	rfnm_fe_srb(dgb_dt, RFNM_LIME0_ANT_E, 0);
+	rfnm_fe_srb(dgb_dt, RFNM_LIME0_ANT_T, 0);
+}
 
 void lime0_ant_tx(struct rfnm_dgb * dgb_dt) {
 	rfnm_fe_srb(dgb_dt, RFNM_LIME0_ANT_T, 0);

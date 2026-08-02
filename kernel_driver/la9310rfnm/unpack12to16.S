@@ -53,44 +53,48 @@ PRFM PLDL1STRM,   [src, #144]
 
 sky_prefetch:
 
-SHL    v0.16b, v20.16b, #4
-USHR   v1.16b, v20.16b, #4
-SHL    v2.16b, v21.16b, #4
-ORR    v1.16b, v1.16b, v2.16b
+// I/Q emit order swapped (conjugate fix): X -> v2/v3, Y -> v0/v1
+SHL    v2.16b, v20.16b, #4
+USHR   v3.16b, v20.16b, #4
+SHL    v1.16b, v21.16b, #4
+ORR    v3.16b, v3.16b, v1.16b
 
-USHR   v2.16b, v21.16b, #4
-SHL    v2.16b, v2.16b, #4
-MOV    v3.16b, v22.16b
+USHR   v0.16b, v21.16b, #4
+SHL    v0.16b, v0.16b, #4
+MOV    v1.16b, v22.16b
  
 
-SHL    v4.16b, v23.16b, #4
-USHR   v5.16b, v23.16b, #4
-SHL    v6.16b, v24.16b, #4
-ORR    v5.16b, v5.16b, v6.16b
+// I/Q emit order swapped (conjugate fix): X -> v6/v7, Y -> v4/v5
+SHL    v6.16b, v23.16b, #4
+USHR   v7.16b, v23.16b, #4
+SHL    v5.16b, v24.16b, #4
+ORR    v7.16b, v7.16b, v5.16b
 
-USHR   v6.16b, v24.16b, #4
-SHL    v6.16b, v6.16b, #4
-MOV    v7.16b, v25.16b
+USHR   v4.16b, v24.16b, #4
+SHL    v4.16b, v4.16b, #4
+MOV    v5.16b, v25.16b
  
 
-SHL    v8.16b, v26.16b, #4
-USHR   v9.16b, v26.16b, #4
-SHL    v10.16b, v27.16b, #4
-ORR    v9.16b, v9.16b, v10.16b
+// I/Q emit order swapped (conjugate fix): X -> v10/v11, Y -> v8/v9
+SHL    v10.16b, v26.16b, #4
+USHR   v11.16b, v26.16b, #4
+SHL    v9.16b, v27.16b, #4
+ORR    v11.16b, v11.16b, v9.16b
 
-USHR   v10.16b, v27.16b, #4
-SHL    v10.16b, v10.16b, #4
-MOV    v11.16b, v28.16b
+USHR   v8.16b, v27.16b, #4
+SHL    v8.16b, v8.16b, #4
+MOV    v9.16b, v28.16b
  
 
-SHL    v12.16b, v29.16b, #4
-USHR   v13.16b, v29.16b, #4
-SHL    v14.16b, v30.16b, #4
-ORR    v13.16b, v13.16b, v14.16b
+// I/Q emit order swapped (conjugate fix): X -> v14/v15, Y -> v12/v13
+SHL    v14.16b, v29.16b, #4
+USHR   v15.16b, v29.16b, #4
+SHL    v13.16b, v30.16b, #4
+ORR    v15.16b, v15.16b, v13.16b
 
-USHR   v14.16b, v30.16b, #4
-SHL    v14.16b, v14.16b, #4
-MOV    v15.16b, v31.16b
+USHR   v12.16b, v30.16b, #4
+SHL    v12.16b, v12.16b, #4
+MOV    v13.16b, v31.16b
 
 
 

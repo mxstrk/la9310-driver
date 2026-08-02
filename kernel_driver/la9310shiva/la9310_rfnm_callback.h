@@ -1,6 +1,5 @@
-/* SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0)
- * Copyright 2017, 2021 NXP
- */
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 RFNM
 
 #ifndef __LA9310_HOST_RFNM_CALLBACK_H__
 #define __LA9310_HOST_RFNM_CALLBACK_H__

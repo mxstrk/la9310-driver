@@ -236,12 +236,18 @@ static irqreturn_t la9310_irq_handler(int irq, void *dev)
 	int j;
 	int sts_bits;
 	int match = 0;
-	int num_words = la9310_mem_r(irq_mux->irq_evt_cfg_reg) &
-							NIRQ_WORDS_MASK;
+	int num_words;
 	u32 num_irq = irq_mux->num_irq;
 	u32 irq_evt_sts_reg;
 	u32 irq_evt_en_reg;
 	int irq_base;
+
+	/* RFNM: the whole handler is LA9310 window MMIO - skip while the link is down (hard reprobe) */
+	if (rfnm_la9310_mmio_fenced()) {
+		return IRQ_HANDLED;
+	}
+
+	num_words = la9310_mem_r(irq_mux->irq_evt_cfg_reg) & NIRQ_WORDS_MASK;
 
 	irq_mux->irq_stats.num_hw_irq_recv++;
 	for (j = 0; j < num_words; j++) {
@@ -273,7 +279,7 @@ int la9310_request_irq(struct la9310_dev *la9310_dev,
 	int err = 0;
 	u32 num_irq = (la9310_mem_r(&irq_evt_regs->irq_evt_cfg) & NIRQ_MASK) >>
 									    8;
-        dev_info(la9310_dev->dev,"num_irq %d",num_irq);
+        dev_dbg(la9310_dev->dev,"num_irq %d",num_irq);
 
 	la9310_create_outbound_msi(la9310_dev);
 	if (!num_irq) {
@@ -287,7 +293,7 @@ int la9310_request_irq(struct la9310_dev *la9310_dev,
 					la9310_irq_handler, 0, la9310_dev->name,
 					(void *)la9310_dev);
 		if (!err) {
-			dev_info(la9310_dev->dev, "irq mux %d allocated successfully\n",
+			dev_dbg(la9310_dev->dev, "irq mux %d allocated successfully\n",
 				la9310_get_msi_irq(la9310_dev, MSI_IRQ_MUX));
 		} else {
 			irq_free_descs(la9310_dev->la9310_irq_priv->irq_base,
