@@ -855,6 +855,12 @@ la9310_base_probe(struct la9310_dev *la9310_dev)
 		}
 	}
 
+	/* Non-fatal: without the modinfo device only the NXP host tools lose
+	 * their address lookup; the radio stack itself never uses it.
+	 */
+	if (la9310_modinfo_init(la9310_dev))
+		pr_warn("%s: modinfo device unavailable\n", __func__);
+
 out:
 	if (rc)
 		la9310_base_deinit(la9310_dev, init_stage, i);
@@ -944,6 +950,7 @@ la9310_base_remove(struct la9310_dev *la9310_dev)
 	iounmap(host_region->vaddr);
 	host_region->vaddr = NULL;
 
+	la9310_modinfo_exit(la9310_dev);
 	la9310_subdrv_remove(la9310_dev);
 
 	la9310_clean_request_irq(la9310_dev, &la9310_dev->hif->irq_evt_regs);

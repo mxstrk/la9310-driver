@@ -397,6 +397,8 @@ void la9310_create_ipc_hugepage_outbound(struct la9310_dev *la9310_dev,
 		uint64_t phys_addr, uint32_t size);
 extern int la9310_get_msi_irq(struct la9310_dev *, enum la9310_msi_id);
 struct la9310_dev *get_la9310_dev_byname(const char *name);
+int la9310_modinfo_init(struct la9310_dev *la9310_dev);
+int la9310_modinfo_exit(struct la9310_dev *la9310_dev);
 void la9310_init_ep_pcie_allocator(struct la9310_dev *la9310_dev);
 uint32_t la9310_alloc_ep_pcie_addr(struct la9310_dev *la9310_dev,
 				   uint32_t window_size);
