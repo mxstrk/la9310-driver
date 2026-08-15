@@ -315,6 +315,40 @@ la9310_create_rfnm_iqflood_outbound(struct la9310_dev *la9310_dev)
 	dev_dbg(la9310_dev->dev, "RFNM IQFLOOD Buff:0x%x[H]-0x%x[M],size %d\n",
 		 LA9310_IQFLOOD_PHYS_ADDR, RFNM_IQFLOOD_MEMADDR, RFNM_IQFLOOD_MEMSIZE);
 }
+
+/*
+ * Second view of the same iqflood carveout, at the EP address the NXP iqplayer
+ * VSPA image hardcodes: IQFLOOD_OUTBOUND_ADDR (iqplayer_cwproj/include/
+ * vspa_dmem_proxy.h) == 0xB0001000, i.e. MSI window base + PCIE_MSI_OB_SIZE,
+ * which is how NXP's own driver computes LA9310_IQFLOOD_PHYS_ADDR. This fork
+ * maps iqflood at 0xC0000000 instead, so without this window every iqplayer
+ * DMA (and any mailbox message carrying an EP address payload) targets an
+ * unmapped region and the iq_app TX/RX FIFOs never move data.
+ *
+ * Uses LA9310_V2H_OUTBOUND_WIN (OUTBOUND_3) - the same window NXP picks, and
+ * free in this fork (its only user, ocram, is #if 0'd below). The existing
+ * 0xC0000000 view on OUTBOUND_2 is left untouched, so the RFNM datapath is
+ * unaffected.
+ */
+void
+la9310_create_iqplayer_iqflood_outbound(struct la9310_dev *la9310_dev)
+{
+	struct la9310_mem_region_info *ccsr_region;
+	u32 ep_addr = LA9310_EP_TOHOST_MSI_PHY_ADDR + PCIE_MSI_OB_SIZE;
+
+	ccsr_region = &la9310_dev->mem_regions[LA9310_MEM_REGION_CCSR];
+
+	ls_pcie_iatu_outbound_set(ccsr_region->vaddr + PCIE_RHOM_DBI_BASE,
+			LA9310_V2H_OUTBOUND_WIN,
+			PCIE_ATU_TYPE_MEM,
+			ep_addr,
+			RFNM_IQFLOOD_MEMADDR,
+			RFNM_IQFLOOD_MEMSIZE);
+	dev_info(la9310_dev->dev,
+		 "iqplayer IQFLOOD Buff:0x%x[H]-0x%x[M],size %d (win %d)\n",
+		 ep_addr, RFNM_IQFLOOD_MEMADDR, RFNM_IQFLOOD_MEMSIZE,
+		 LA9310_V2H_OUTBOUND_WIN);
+}
 #if 0
 void
 la9310_create_rfnm_ocram_outbound(struct la9310_dev *la9310_dev)
@@ -738,6 +772,9 @@ la9310_base_probe(struct la9310_dev *la9310_dev)
 	}
 
 	la9310_create_rfnm_iqflood_outbound(la9310_dev);
+
+	/* extra EP view at 0xB0001000 for the NXP iqplayer image (see above) */
+	la9310_create_iqplayer_iqflood_outbound(la9310_dev);
 
 	//la9310_create_rfnm_ocram_outbound(la9310_dev);
 
