@@ -33,6 +33,8 @@
 #include <linux/slab.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
 #include <linux/rfnm-vspa.h>
 
 #include "la9310_base.h"
@@ -190,10 +192,24 @@ void la9310_modinfo_get(struct la9310_dev *la9310_dev, modinfo_t *mi)
 	mi->adc_rate_mask = adc_rate_mask;
 	mi->dac_rate_mask = dac_rate_mask;
 
-	/* RFNM iqflood carveout (EP view 0xC0000000, NOT NXP's 0xB0001000) */
-	mi->iqflood.modem_phy_addr = LA9310_IQFLOOD_PHYS_ADDR;
+	/*
+	 * iqflood as the NXP host tools expect it.
+	 *
+	 * modem_phy_addr must be the *iqplayer* EP alias (0xB0001000), not
+	 * RFNM's 0xC0000000: the host scripts read this base at runtime and
+	 * hand it to vspa_mbox (iq-replay.sh:36,51), while only the DMEM-proxy
+	 * base is compiled into the VSPA image. Report 0xC0000000 here and
+	 * streaming and the proxy end up on two different outbound windows.
+	 * la9310_create_iqplayer_iqflood_outbound() creates the matching window.
+	 *
+	 * size must be the REAL carveout (112 MB), not RFNM_IQFLOOD_MEMSIZE
+	 * (208 MB, which deliberately spans iqflood + the iqusb carveout):
+	 * lib_iqplayer places the proxy at size-1024 and the RX FIFO at size/2,
+	 * so 208 MB lands them inside RFNM's USB buffer and nothing works.
+	 */
+	mi->iqflood.modem_phy_addr = LA9310_IQPLAYER_IQFLOOD_EP_ADDR;
 	mi->iqflood.host_phy_addr = RFNM_IQFLOOD_MEMADDR;
-	mi->iqflood.size = RFNM_IQFLOOD_MEMSIZE;
+	mi->iqflood.size = LA9310_IQPLAYER_IQFLOOD_SIZE;
 }
 
 static long la9310_modinfo_ioctl(struct file *filp, unsigned int cmd,
@@ -308,6 +324,85 @@ static const struct file_operations la9310_modinfo_fops = {
 static struct miscdevice la9310_modinfo_miscdev[MAX_MODEM_INSTANCES];
 static char la9310_modinfo_names[MAX_MODEM_INSTANCES][16];
 
+/*
+ * Global /sys/shiva/ group with a shiva_status attribute.
+ *
+ * NXP's driver creates this in la9310_init_global_sysfs(); this fork hangs all
+ * of its sysfs under the PCI device (la9310sysfs) and has no global node at
+ * all. Every NXP host tool stat()s /sys/shiva/shiva_status before doing
+ * anything and exits with "la9310 shiva driver not started" if it is missing
+ * (iq_app.c:195) - on an otherwise completely healthy stack. The file is only
+ * stat()ed, never parsed, but we report something useful anyway.
+ */
+static struct kobject *la9310_shiva_kobj;
+static struct la9310_dev *la9310_shiva_devs[MAX_MODEM_INSTANCES];
+
+static ssize_t shiva_status_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	int i, len = 0;
+
+	for (i = 0; i < MAX_MODEM_INSTANCES; i++) {
+		if (la9310_shiva_devs[i])
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+					 "modem %d: %s ready\n",
+					 i, la9310_shiva_devs[i]->name);
+	}
+	if (!len)
+		len = scnprintf(buf, PAGE_SIZE, "no modem\n");
+
+	return len;
+}
+
+static struct kobj_attribute shiva_status_attr =
+	__ATTR(shiva_status, 0444, shiva_status_show, NULL);
+
+static struct attribute *la9310_shiva_attrs[] = {
+	&shiva_status_attr.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(la9310_shiva);
+
+static int la9310_shiva_sysfs_add(struct la9310_dev *la9310_dev)
+{
+	int rc;
+
+	if (!la9310_shiva_kobj) {
+		la9310_shiva_kobj = kobject_create_and_add("shiva", NULL);
+		if (!la9310_shiva_kobj)
+			return -ENOMEM;
+
+		rc = sysfs_create_groups(la9310_shiva_kobj,
+					 la9310_shiva_groups);
+		if (rc) {
+			kobject_put(la9310_shiva_kobj);
+			la9310_shiva_kobj = NULL;
+			return rc;
+		}
+		dev_info(la9310_dev->dev, "la9310_modinfo: /sys/shiva created\n");
+	}
+
+	la9310_shiva_devs[la9310_dev->id] = la9310_dev;
+	return 0;
+}
+
+static void la9310_shiva_sysfs_del(struct la9310_dev *la9310_dev)
+{
+	int i;
+
+	la9310_shiva_devs[la9310_dev->id] = NULL;
+
+	for (i = 0; i < MAX_MODEM_INSTANCES; i++)
+		if (la9310_shiva_devs[i])
+			return;		/* another modem still present */
+
+	if (la9310_shiva_kobj) {
+		sysfs_remove_groups(la9310_shiva_kobj, la9310_shiva_groups);
+		kobject_put(la9310_shiva_kobj);
+		la9310_shiva_kobj = NULL;
+	}
+}
+
 int la9310_modinfo_init(struct la9310_dev *la9310_dev)
 {
 	int rc = -1;
@@ -330,15 +425,22 @@ int la9310_modinfo_init(struct la9310_dev *la9310_dev)
 
 	rc = misc_register(miscdev);
 
-	if (rc)
+	if (rc) {
 		dev_err(la9310_dev->dev,
 			"la9310_modinfo: failed to register misc device\n");
-	else
-		dev_info(la9310_dev->dev,
-			 "la9310_modinfo: /dev/%s ready (minor %d)\n",
-			 miscdev->name, miscdev->minor);
+		return rc;
+	}
 
-	return rc;
+	dev_info(la9310_dev->dev,
+		 "la9310_modinfo: /dev/%s ready (minor %d)\n",
+		 miscdev->name, miscdev->minor);
+
+	/* NXP host tools refuse to start without this - see comment above */
+	if (la9310_shiva_sysfs_add(la9310_dev))
+		dev_warn(la9310_dev->dev,
+			 "la9310_modinfo: /sys/shiva not created - NXP host tools will refuse to start\n");
+
+	return 0;
 }
 EXPORT_SYMBOL_GPL(la9310_modinfo_init);
 
@@ -349,6 +451,7 @@ int la9310_modinfo_exit(struct la9310_dev *la9310_dev)
 			la9310_dev->id);
 		return -1;
 	}
+	la9310_shiva_sysfs_del(la9310_dev);
 	if (la9310_modinfo_miscdev[la9310_dev->id].fops)
 		misc_deregister(&la9310_modinfo_miscdev[la9310_dev->id]);
 	return 0;

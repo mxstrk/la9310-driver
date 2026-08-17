@@ -328,26 +328,33 @@ la9310_create_rfnm_iqflood_outbound(struct la9310_dev *la9310_dev)
  * Uses LA9310_V2H_OUTBOUND_WIN (OUTBOUND_3) - the same window NXP picks, and
  * free in this fork (its only user, ocram, is #if 0'd below). The existing
  * 0xC0000000 view on OUTBOUND_2 is left untouched, so the RFNM datapath is
- * unaffected.
+ * unaffected. Inert for the stock pairing: the RFNM image never emits an
+ * address in this range.
+ *
+ * Size is LA9310_IQPLAYER_IQFLOOD_SIZE - the *real* iqflood carveau, NOT
+ * RFNM_IQFLOOD_MEMSIZE (0xD000000 = 208 MB), which deliberately spans iqflood
+ * AND the adjacent iqusb carveout at RFNM_IQFLOOD_USB_MEMADDR. The NXP host
+ * tools derive buffer positions from the size modinfo reports (proxy at
+ * size-1024, RX FIFO at size/2), so 208 MB puts the proxy at 0xA33FFC00 inside
+ * RFNM's USB buffer and nothing works.
  */
 void
 la9310_create_iqplayer_iqflood_outbound(struct la9310_dev *la9310_dev)
 {
 	struct la9310_mem_region_info *ccsr_region;
-	u32 ep_addr = LA9310_EP_TOHOST_MSI_PHY_ADDR + PCIE_MSI_OB_SIZE;
 
 	ccsr_region = &la9310_dev->mem_regions[LA9310_MEM_REGION_CCSR];
 
 	ls_pcie_iatu_outbound_set(ccsr_region->vaddr + PCIE_RHOM_DBI_BASE,
 			LA9310_V2H_OUTBOUND_WIN,
 			PCIE_ATU_TYPE_MEM,
-			ep_addr,
+			LA9310_IQPLAYER_IQFLOOD_EP_ADDR,
 			RFNM_IQFLOOD_MEMADDR,
-			RFNM_IQFLOOD_MEMSIZE);
+			LA9310_IQPLAYER_IQFLOOD_SIZE);
 	dev_info(la9310_dev->dev,
 		 "iqplayer IQFLOOD Buff:0x%x[H]-0x%x[M],size %d (win %d)\n",
-		 ep_addr, RFNM_IQFLOOD_MEMADDR, RFNM_IQFLOOD_MEMSIZE,
-		 LA9310_V2H_OUTBOUND_WIN);
+		 LA9310_IQPLAYER_IQFLOOD_EP_ADDR, RFNM_IQFLOOD_MEMADDR,
+		 LA9310_IQPLAYER_IQFLOOD_SIZE, LA9310_V2H_OUTBOUND_WIN);
 }
 #if 0
 void
