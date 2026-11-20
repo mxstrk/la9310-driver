@@ -1,0 +1,56 @@
+rfnm_qec in decimated RX sessions (branch qec-decimated, 2026-11-20)
+====================================================================
+
+What changed
+------------
+Stock rfnm_qec only samples the native 122.88 MSps ring (qec_poll bails out unless
+rfnm_stream_is_native_rx() and rfnm_local_rx_fmt == PACKED12). On-board apps (lorad,
+adsld at 2 MSps = DCS 128 MHz, dcs1, k=5) therefore got neither the analog DC null nor
+eps/phi estimation. The corrector itself already ran: the VSPA (apm-stock.eld) applies
+iq_comp_params2_rx_dec @DMEM 0x2580 to the decimated ring (bench-proven on RFNM Blue
+.124 at dcs0 k1-3 and dcs1 k3-6; 0x2600 has no effect there).
+
+This branch adds, only in kernel_driver/la9310rfnm/rfnm_qec_main.c:
+  - qec_dec_mode(): decodes the stream word via the exported rfnm_la9310_get_clock_state;
+    rejects any TX share, k=0 and depths outside the rfnm_lalib RX ladder.
+  - qec_dec_slot(): parser for decimated slots (variable subs, descriptors read once,
+    epoch/DISCONT subs skipped, lags inside a sub only). The ring is raw packed12 VSPA
+    output in every session, so the decimated path does not check rfnm_local_rx_fmt.
+  - Module params (all 0644, change at runtime under /sys/module/rfnm_qec/parameters/):
+      dec_enable=1    sample decimated rings (0 = stock behaviour)
+      dec_dc_null=1   run the analog DCOFF null in decimated sessions, starting from the
+                      live rfic_dc_i/q codes
+      dec_iq=0        eps/phi model for rx_dec (seed-relative clamp, divergence latch).
+                      Keep 0: on real 2 MSps signals the lag regression is ill-conditioned
+                      (phi estimates 0.4-0.9 rad vs measured residual ~0.025).
+      dec_max_q20=52429, dec_step_q20=8192   dec_iq clamp / step
+  With dec_iq=0 no DMA write happens in a decimated session (read-only + analog trim).
+
+Measured on .124 (2026-11-20, 2 MSps, gain 30, LPF 4 MHz): DC -24..-26 dBFS -> -37..-53
+dBFS; image rejection 34-36 -> 37-39 dB; lorad no regression.
+
+Build (host, matches the deployed vermagic 6.6.36-rt35-ga13146252326)
+-----------------------------------------------------------------------
+  Kernel tree rfnm/imx8mp-kernel a131462, Module.symvers of la9310shiva + la9310rfnm
+  from a564201, aarch64-linux-gnu-gcc 14.2.0 (Debian 13 container):
+    make -C <ksrc> ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+      M=<repo>/kernel_driver/la9310rfnm KBUILD_EXTRA_SYMBOLS=<extra.symvers> ... modules
+  Only rfnm_qec.ko is needed; the core la9310rfnm.ko is unchanged.
+  New undefined symbols vs stock: rfnm_la9310_get_clock_state, rfnm_tx_slot_rate_hz
+  (both exported by the stock core module).
+
+Deploy (no core reload, radio must be free)
+-------------------------------------------
+  curl -X POST -H 'Content-Type: application/json' -d '{"owner":"none"}' localhost/api/v1/radio
+  cp /rfnm/kernel/rfnm_qec.ko /rfnm/kernel/rfnm_qec.ko.stock    # keep stock once
+  rmmod rfnm_qec
+  cp rfnm_qec.ko /rfnm/kernel/rfnm_qec.ko && insmod /rfnm/kernel/rfnm_qec.ko
+  dmesg | grep rfnm_qec      # expect 'ring mode none -> dec dcs1 k5' on the next session
+  Defaults are compiled in: load_drivers uses plain insmod, which ignores modprobe.d.
+
+Rollback
+--------
+  Runtime:  echo 0 > /sys/module/rfnm_qec/parameters/dec_dc_null   (or dec_enable)
+  Module:   release lease; rmmod rfnm_qec;
+            cp /rfnm/kernel/rfnm_qec.ko.stock /rfnm/kernel/rfnm_qec.ko;
+            insmod /rfnm/kernel/rfnm_qec.ko
