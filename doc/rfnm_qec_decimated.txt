@@ -97,3 +97,32 @@ Rollback
   Module:   release lease; rmmod rfnm_qec;
             cp /rfnm/kernel/rfnm_qec.ko.stock /rfnm/kernel/rfnm_qec.ko;
             insmod /rfnm/kernel/rfnm_qec.ko
+
+Boot model seed (branch qec-boot-model, 2026-11-21)
+---------------------------------------------------
+Problem: eps/phi/tau are learned only in native 122.88 MSps sessions. After a boot the
+on-board apps run decimated only (RTSA boot session dcs0 k1, then lorad dcs1 k5), so the
+model stays 0 and rx_dec (0x2580) holds identity: IRR 35.0 dB after reboot vs 37.4-38.9 dB
+with a full-rate model (.124, 2026-11-20). A short native session at boot does not help:
+one solve needs min_samples = 4M sampled values, ~24 s of native streaming (measured
+2026-11-20, solves 23.6 s apart), and beta 64/256 needs ~8 solves to converge.
+
+Fix: persist the learned model across loads.
+  init_eps_q20, init_phi_q20, init_tau_q20 (0444, insmod only)   seed m_eps/m_phi/m_tau
+      before the first corrector write; the corr_dead revive path writes the seed to
+      0x2600 and 0x2580 as soon as the fw layout verifies. |value| >= 2^18 -> ignored.
+  model (0444, read-only)   the current model as insmod args:
+      init_eps_q20=<e> init_phi_q20=<p> init_tau_q20=<t>
+DC is deliberately not seeded (moves with every retune; the analog null owns it).
+The decimated model (dec_iq) seeds from m_eps/m_phi, so it starts from the seed too.
+
+Assumption: a stored model is specific to the board (mixer/ADC mismatch) and only
+approximately valid at other gains, LOs and temperatures; native sessions keep refining it.
+
+Board side (not part of the driver): /rfnm/scripts/qec_model_save writes the param to
+/rfnm/calib/rfnm_qec.model when it changed and is non-zero (rfnm-qec-model-save.timer,
+30 min); load_drivers passes the file to insmod and falls back to a plain insmod:
+  QEC_MODEL=$(grep -Ex 'init_eps_q20=-?[0-9]+ init_phi_q20=-?[0-9]+ init_tau_q20=-?[0-9]+' /rfnm/calib/rfnm_qec.model 2>/dev/null)
+  insmod /rfnm/kernel/rfnm_qec.ko $QEC_MODEL || { [ -n "$QEC_MODEL" ] && insmod /rfnm/kernel/rfnm_qec.ko; }
+Runtime swap with the seed:  rmmod rfnm_qec; insmod /rfnm/kernel/rfnm_qec.ko $(cat /rfnm/calib/rfnm_qec.model)
+Rollback: rm /rfnm/calib/rfnm_qec.model (next load starts from zero, as before).

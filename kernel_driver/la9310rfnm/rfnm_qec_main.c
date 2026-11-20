@@ -185,6 +185,23 @@ static int dec_step_q20 = 8192;
 module_param(dec_step_q20, int, 0644);
 MODULE_PARM_DESC(dec_step_q20, "decimated model max step per solve, Q20 (8192 = 0.0078)");
 
+// The RX model only learns in native full-rate sessions, and those may never happen between
+// boots (on-board apps run decimated), so a fresh insmod would leave both correctors at
+// identity. init_* seed the model at insmod with values a previous load learned (read them
+// from the "model" param below, pass them back as insmod args). They are specific to the
+// board, and only approximately valid at other gains/temperatures - the native solves keep
+// refining them as before. DC is not seeded: it moves with every retune (the analog null
+// owns it, the digital dc relearns per session).
+static int init_eps_q20;
+module_param(init_eps_q20, int, 0444);
+MODULE_PARM_DESC(init_eps_q20, "RX model seed at insmod: eps, Q20 (ignored if |value| >= 2^18)");
+static int init_phi_q20;
+module_param(init_phi_q20, int, 0444);
+MODULE_PARM_DESC(init_phi_q20, "RX model seed at insmod: phi, Q20 (ignored if |value| >= 2^18)");
+static int init_tau_q20;
+module_param(init_tau_q20, int, 0444);
+MODULE_PARM_DESC(init_tau_q20, "RX model seed at insmod: tau, Q20 (ignored if |value| >= 2^18)");
+
 // ---- TX QEC coefficient interface (host-driven cross-board cal) -----------------
 // The TX cal loop runs on a host: one board transmits, a second board measures, the host
 // solves and writes coefficients HERE (q20 fixed point, floats * 2^20). Writing 1 to
@@ -514,6 +531,18 @@ static int tx_write_set(const char *val, const struct kernel_param *kp) {
 }
 static const struct kernel_param_ops tx_write_ops = { .set = tx_write_set };
 module_param_cb(tx_write, &tx_write_ops, NULL, 0200);
+
+// current RX model as insmod arguments (feeds init_* on the next load)
+static int model_get(char *buf, const struct kernel_param *kp) {
+	if (!qec) {
+		return -ENODEV;
+	}
+	return scnprintf(buf, PAGE_SIZE, "init_eps_q20=%d init_phi_q20=%d init_tau_q20=%d\n",
+		READ_ONCE(qec->m_eps), READ_ONCE(qec->m_phi), READ_ONCE(qec->m_tau));
+}
+static const struct kernel_param_ops model_ops = { .get = model_get };
+module_param_cb(model, &model_ops, NULL, 0444);
+MODULE_PARM_DESC(model, "current RX model eps/phi/tau, Q20, formatted as insmod args for init_*");
 
 static void qec_slot_scalar(const u16 *p, s16 *v, struct qec_sums *out) {
 	s64 i0, q0, im, qm;
@@ -1482,6 +1511,13 @@ static int __init qec_init(void) {
 	st->last_rx_buf_id = ~0U;
 	st->was_idle = 1;
 	st->last_slot = st->status->rx_buf_id % QEC_ADC_SLOT_CNT;
+	if (abs(init_eps_q20) < QEC_DEC_EST_MAX && abs(init_phi_q20) < QEC_DEC_EST_MAX && abs(init_tau_q20) < QEC_DEC_EST_MAX) {
+		st->m_eps = init_eps_q20;
+		st->m_phi = init_phi_q20;
+		st->m_tau = init_tau_q20;
+	} else {
+		printk("rfnm_qec: init model (%d,%d,%d) out of range - starting from zero\n", init_eps_q20, init_phi_q20, init_tau_q20);
+	}
 
 	// A corrector-layout mismatch (fw DMEM moved or a ring resized) must NOT kill the
 	// module: the analog DCOFF null is SPI-only and load-bearing (the DC guard trusts it
@@ -1493,7 +1529,7 @@ static int __init qec_init(void) {
 		printk("rfnm_qec: CORRECTOR DEAD (layout verify failed) - analog DC null still active, no VSPA writes\n");
 		st->corr_dead = 1;
 	} else {
-		// establish known corrector state: identity at D=2 (model zero)
+		// establish known corrector state: identity at D=2 (model zero), or the init_* seed
 		ret = qec_dma_write_params(st);
 		if (ret) {
 			printk("rfnm_qec: initial params write failed (VSPA down?)\n");
@@ -1507,8 +1543,8 @@ static int __init qec_init(void) {
 		goto fail_unmap;
 	}
 	wake_up_process(st->task);
-	printk("rfnm_qec: loaded (params2 @0x%x, cpu %d, period %d ms, solve %d ms, beta %d/256, %s)\n",
-		QEC_PARAMS2_DMEM, QEC_CPU, period_ms, solve_ms, beta_q8, use_neon ? "neon" : "scalar");
+	printk("rfnm_qec: loaded (params2 @0x%x, cpu %d, period %d ms, solve %d ms, beta %d/256, %s, model eps=%d phi=%d tau=%d)\n",
+		QEC_PARAMS2_DMEM, QEC_CPU, period_ms, solve_ms, beta_q8, use_neon ? "neon" : "scalar", st->m_eps, st->m_phi, st->m_tau);
 	return 0;
 
 fail_unmap:
