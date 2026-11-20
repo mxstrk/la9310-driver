@@ -25,8 +25,9 @@
 // iq_comp_params2_rx_dec, and only at depths a bench proved the fw applies it. Defaults:
 // dec_dc_null=1 (the analog DC null runs in decimated sessions; RFNM .124 2026-11-20: 2 MSps
 // DC -24 -> -37..-50 dBFS, lorad unchanged or better) and dec_iq=0 (eps/phi telemetry only, no
-// DMA: on real 2 MSps signals the lag regression estimates phi ~0.4-0.9 rad against a measured
-// residual of ~0.025, so every update would be rejected - not usable yet).
+// DMA: on real 2 MSps signals the lag regression estimated phi ~0.4-0.9 rad against a measured
+// residual of ~0.025; decimated windows now use the first-difference estimator in qec_solve(),
+// offline-validated on real captures, but the estimate->rx_dec sign is not proven on silicon yet).
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -61,7 +62,7 @@
 #define QEC_MODE_NATIVE		1		// packed12, no DCS, no decimation: qec_slot_valid()
 #define QEC_MODE_DEC		0x100		// | rx_dcs << 4 | k: RX-only decimation 2^k, qec_dec_slot()
 #define QEC_DEC_EST_MAX		(1 << 18)	// |estimate| above 0.25 is not an IQ imbalance
-#define QEC_DEC_DIV_FLOOR	(1 << 10)	// divergence latch ignores residuals below ~1e-3 (noise)
+#define QEC_DEC_DIV_FLOOR	(1 << 12)	// divergence latch ignores residuals below ~4e-3 (est noise ~1.5e-3/window at 2 MSps)
 #define QEC_DEC_DIVERGE		3		// solves in a row with a growing same-sign residual
 
 void kernel_neon_begin(void);
@@ -260,6 +261,7 @@ struct qec_state {
 	int m_dec_mode;
 	int m_dec_ok;				// live mode is m_dec_mode, a proven depth, and not diverged
 	int dec_written;			// rx_dec holds the decimated model (not the full-rate one)
+	int dec_learned;			// the decimated model took an accepted step since its seed
 	int dec_div;				// divergence latch tripped at m_dec_mode
 	int dec_grow;
 	s64 dec_e_last, dec_p_last;
@@ -367,7 +369,7 @@ static int qec_dma_write_params(struct qec_state *st) {
 	}
 	// decimated paths: tau is per-sample, so it halves at 2x. 4x reuses the 2x taps (tau is
 	// ~3e-3 samples here, the residual stays below -60 dB either way)
-	if (dec_iq && st->m_dec_ok) {
+	if (dec_iq && st->m_dec_ok && st->dec_learned) {
 		// the decimated model owns rx_dec: same writer with its eps/phi, tau per decimated
 		// sample (2^k), dc 0 (the analog null owns DC there; the full-rate digital dc was
 		// learned on another clock plan)
@@ -395,9 +397,10 @@ static int qec_dma_write_params(struct qec_state *st) {
 }
 
 // may this session's poll write the corrector? Native: always (as before). Decimated: only
-// when there is a decimated model to (re)assert or one to take back - telemetry stays read-only
+// when there is a decimated model to (re)assert or one to take back - telemetry stays read-only,
+// and so does dec_iq until its first accepted update (rx_dec keeps the full-rate model till then)
 static int qec_may_write(struct qec_state *st) {
-	return st->mode == QEC_MODE_NATIVE || (st->m_dec_ok && (dec_iq || st->dec_written));
+	return st->mode == QEC_MODE_NATIVE || (st->m_dec_ok && ((dec_iq && st->dec_learned) || st->dec_written));
 }
 
 // hand rx_dec back to the full-rate model (what it held before a decimated model was written)
@@ -602,9 +605,10 @@ static int qec_dec_proven(int mode) {
 }
 
 // divergence latch input: a same-sign residual above the noise floor that grew since the last
-// solve (each step went its way, so a converging loop must have shrunk it)
+// solve by more than the floor again (each step went its way, so a converging loop must have
+// shrunk it; the margin keeps window noise from tripping it while the loop still converges)
 static int qec_dec_grew(s64 est, s64 *last) {
-	int grew = *last && abs(est) > QEC_DEC_DIV_FLOOR && (est < 0) == (*last < 0) && abs(est) > abs(*last);
+	int grew = *last && abs(est) > QEC_DEC_DIV_FLOOR && (est < 0) == (*last < 0) && abs(est) > abs(*last) + QEC_DEC_DIV_FLOOR;
 
 	*last = est;
 	return grew;
@@ -624,6 +628,11 @@ static void qec_dec_update(struct qec_state *st, s64 e_q20, s64 p_q20, s64 dom) 
 
 	if (!dec_iq || !st->m_dec_ok || st->corr_dead) {
 		return;				// telemetry only
+	}
+	if (!((st->m_dec_mode >> 4) & 1)) {
+		// dcs0 (k1-3, 15-61 MSps): ambient bursts rule the window means there, the estimate
+		// missed the measured residual on 8 of 12 captures - telemetry only there
+		return;
 	}
 	if (dom > dc_renull_counts) {
 		st->stat_dec_hold++;
@@ -650,12 +659,14 @@ static void qec_dec_update(struct qec_state *st, s64 e_q20, s64 p_q20, s64 dom) 
 			(st->m_dec_mode >> 4) & 1, st->m_dec_mode & 0xf, e_q20, p_q20, st->m_dec_eps, st->m_dec_phi);
 		st->m_dec_eps = st->m_dec_eps0;
 		st->m_dec_phi = st->m_dec_phi0;
+		st->dec_learned = 0;
 		st->dec_div = 1;
 		qec_dec_release(st);
 		return;
 	}
 	st->m_dec_eps = (s32)ne;
 	st->m_dec_phi = (s32)np;
+	st->dec_learned = 1;
 	st->stat_dec_solves++;
 }
 
@@ -778,6 +789,25 @@ static void qec_solve(struct qec_state *st) {
 			ic[m] = eiq + eqi;
 		}
 	}
+	if (st->mode != QEC_MODE_NATIVE) {
+		// decimated window: first difference x(n)-x(n-1), i.e. lag 0 minus lag 1, tau pinned to
+		// the full-rate model. On real 2 MSps signals the lag regression below is ruled by a slow,
+		// linearly polarized component (DC wander, LO leakage: rc/ic flat over all lags) and says
+		// phi 0.4-0.9; the difference cancels it and matches the measured residual g/rho
+		// (2026-11-21, 29 real captures at 1-8 MSps: phi 29, eps 28 within 20 % or 0.003, and the
+		// sign of an injected 0x2580 step). Any filter applied to both rails keeps eps/phi.
+		s64 d = ra[0] - ra[1];
+
+		if ((d << 4) > ra[0]) {		// enough power off DC to estimate from
+			e_q20 = qec_div_q20(rc[0] - rc[1], d);
+			p_q20 = qec_div_q20(ic[0] - ic[1], d);
+			qec_dec_update(st, e_q20, p_q20, max(abs(mi_q8 >> 8), abs(mq_q8 >> 8)));
+		} else {
+			st->stat_dec_hold++;
+		}
+		// the full-rate model (0x2600, and the dc/tau terms) is not ours to move
+		goto dec_done;
+	}
 	iap[0] = ia[1];
 	iap[1] = ia[2] >> 1;
 	iap[2] = (ia[3] - ia[1]) >> 1;
@@ -836,11 +866,6 @@ static void qec_solve(struct qec_state *st) {
 		t_q20 = qec_div_q20(s_ib * s_rr2 - s_rb * s_ri, det);
 	}
 
-	if (st->mode != QEC_MODE_NATIVE) {
-		// decimated window: the full-rate model (0x2600, and the dc/tau terms) is not ours to move
-		qec_dec_update(st, e_q20, p_q20, max(abs(mi_q8 >> 8), abs(mq_q8 >> 8)));
-		goto dec_done;
-	}
 	// damped model update; dc measured in 12-bit counts, normalized full scale = 2048
 	st->m_eps += (s32)((e_q20 * beta_q8) >> 8);
 	st->m_phi += (s32)((p_q20 * beta_q8) >> 8);
@@ -878,7 +903,7 @@ dec_done:
 			// decimated window (scalar parser): the line above carries est and the full-rate model
 			printk("rfnm_qec: dec dcs%d k%d | dec slots %u rej %u subskip %u | dec model eps=%d phi=%d (%s%s) solves %u clamp %u hold %u | mean=(%lld,%lld) codes=(%d,%d) null %s\n",
 				(st->mode >> 4) & 1, st->mode & 0xf, st->stat_dec_slots, st->stat_dec_rej, st->stat_dec_subs_skip,
-				st->m_dec_eps, st->m_dec_phi, st->dec_div ? "diverged" : (!st->m_dec_ok ? "unproven depth" : (dec_iq && !st->corr_dead ? "live" : "telemetry")),
+				st->m_dec_eps, st->m_dec_phi, st->dec_div ? "diverged" : (!st->m_dec_ok ? "unproven depth" : (dec_iq && !st->corr_dead && ((st->m_dec_mode >> 4) & 1) ? "live" : "telemetry")),
 				st->dec_written ? ", in rx_dec" : "",
 				st->stat_dec_solves, st->stat_dec_clamp, st->stat_dec_hold, mi_q8 >> 8, mq_q8 >> 8, st->trim_i, st->trim_q,
 				!(dc_null_enable && dec_dc_null) ? "off" : (st->null_frozen ? "frozen" : (st->null_armed ? "armed" : "quiet")));
@@ -1180,7 +1205,7 @@ static void qec_poll(struct qec_state *st) {
 			st->dec_epoch = st->status->rx_epoch & 0xFF;
 			if ((mode & QEC_MODE_DEC) && mode != st->m_dec_mode) {
 				// first session at this depth: rx_dec holds the full-rate eps/phi until we
-				// write ours - seed from there (a native session in between keeps the model)
+				// write ours - seed from there (a native session in between reseeds, below)
 				st->m_dec_mode = mode;
 				st->m_dec_eps = st->m_dec_eps0 = st->m_eps;
 				st->m_dec_phi = st->m_dec_phi0 = st->m_phi;
@@ -1188,6 +1213,18 @@ static void qec_poll(struct qec_state *st) {
 				st->dec_p_last = 0;
 				st->dec_grow = 0;
 				st->dec_div = 0;
+				st->dec_learned = 0;
+			} else if ((mode & QEC_MODE_DEC) && (st->m_eps != st->m_dec_eps0 || st->m_phi != st->m_dec_phi0)) {
+				// the full-rate model moved since the seed (a native session in between, or the
+				// seed predates the first native solve): reseed, keeping what this depth learned
+				// on top of it - the clamp stays relative to the seed
+				st->m_dec_eps += st->m_eps - st->m_dec_eps0;
+				st->m_dec_phi += st->m_phi - st->m_dec_phi0;
+				st->m_dec_eps0 = st->m_eps;
+				st->m_dec_phi0 = st->m_phi;
+				st->dec_e_last = 0;
+				st->dec_p_last = 0;
+				st->dec_grow = 0;
 			}
 			if (mode == st->m_dec_mode && qec_dec_proven(mode) && !st->dec_div) {
 				st->m_dec_ok = 1;

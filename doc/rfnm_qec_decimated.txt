@@ -21,13 +21,44 @@ This branch adds, only in kernel_driver/la9310rfnm/rfnm_qec_main.c:
       dec_dc_null=1   run the analog DCOFF null in decimated sessions, starting from the
                       live rfic_dc_i/q codes
       dec_iq=0        eps/phi model for rx_dec (seed-relative clamp, divergence latch).
-                      Keep 0: on real 2 MSps signals the lag regression is ill-conditioned
-                      (phi estimates 0.4-0.9 rad vs measured residual ~0.025).
+                      Keep 0 until the on-board sign test (below) passed.
       dec_max_q20=52429, dec_step_q20=8192   dec_iq clamp / step
   With dec_iq=0 no DMA write happens in a decimated session (read-only + analog trim).
 
 Measured on .124 (2026-11-20, 2 MSps, gain 30, LPF 4 MHz): DC -24..-26 dBFS -> -37..-53
 dBFS; image rejection 34-36 -> 37-39 dB; lorad no regression.
+
+dec_iq estimator (branch qec-dec-iq, 2026-11-21)
+-----------------------------------------------
+The 2026-11-20 lag regression (eps/phi/tau over lags 0..3) failed on real 2 MSps data:
+phi 0.4-0.9 rad against a measured residual rho ~0.03. Cause (host port of the kernel code on
+the recorded captures): a slow, linearly polarized component (DC wander / LO leakage, below
+~20 kHz) makes rc(m) and ic(m) flat over all lags and dominates every moment.
+Decimated windows now estimate from the first difference x(n)-x(n-1) (lag 0 minus lag 1),
+tau pinned to the full-rate model:
+    eps = (rc0 - rc1) / (ra0 - ra1),   phi = (ic0 - ic1) / (ra0 - ra1)
+(a filter applied to both rails leaves eps/phi unchanged; the difference cancels the slow part).
+Held when ra0 - ra1 < ra0/16 (no power off DC). Offline, integer port on 41 real captures:
+1-8 MSps (dcs1 k3-k6, 29 captures): phi 29/29 and eps 28/29 within 20 % (or 0.003) of the
+qec_ab.py g/rho, and the 0x2580 +0.05/+0.05 injection reads as -0.046..-0.051 on both (right
+sign for the integrator). 15-61 MSps (dcs0): 8 of 12 off (ambient bursts rule the window
+means), so dcs0 depths stay telemetry-only.
+Also: dec_iq writes nothing to 0x2580 before its first accepted update (rx_dec keeps the
+full-rate model till then); the decimated model is reseeded (learned offset kept) when the
+full-rate model moved since its seed; the divergence latch needs |est| > 4e-3 and a growth by
+more than 4e-3 per solve (window noise ~1.5e-3 tripped the old 1e-3 latch in a correct loop).
+Host tests: notes rfnm-qec-open-2026-11-21/a1 (t3 = estimator on captures, t4 = closed loop
+with simulated rx_dec, correct and flipped sign).
+
+On-board sign test (not run yet; RX only, radio released, debug build = this branch +
+rfnm-qec-dec-2026-11-20/debug/rfnm_qec_dbg.patch, dec_iq=0, verbose=1):
+  1. 2 MSps session (rfnmiq 869.368 MHz gain 30 sma_a agc 0, ~60 s): >= 4 'est(uQ20)' lines -> E_off
+  2. dbg_dcre_q20=0 dbg_dcim_q20=0 dbg_target=0 dbg_mode=1 (0x2580 := eps +0.05 phi +0.05) -> E_on
+  3. dbg_mode=0 -> E_off2
+  PASS: E_on - E_off = -(0.05 - seed) on both, i.e. about -0.05 after a reboot (offline on the
+  2026-11-20 injection captures: -0.046..-0.051). Positive delta = flipped chain: leave dec_iq 0.
+  4. After PASS, candidate module, dec_iq=1 in a lorad session: 'dec model' converges to E_off
+  in ~10 solves, no 'diverging'; cs16 capture after: |rho| < 0.005, IRR_coh rises.
 
 Build (host, matches the deployed vermagic 6.6.36-rt35-ga13146252326)
 -----------------------------------------------------------------------
