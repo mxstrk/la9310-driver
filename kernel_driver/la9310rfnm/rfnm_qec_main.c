@@ -13,10 +13,15 @@
 // Only Re a may multiply eps/phi (mirror-term algebra) - using complex a leaks eps into phi/tau.
 //
 // Maps everything it needs itself and can be loaded/unloaded at runtime. Only accumulates in
-// full-rate mode (sub size 256) on adc 0 (Lime). Since the DC reform this module
+// full-rate mode (sub size 256) on adc 0 (Lime), or on decimated rings (below). Since the DC reform this module
 // also OWNS the analog DC null (design rule: DC correction does not belong in the AGC): a
 // one-shot measured DCOFF trim through the generic dgb layer on every RX apply - see the
 // dc_null block below. That is the single coupling to the dgb layer.
+//
+// Decimated sessions: the same estimator also runs on the decimated ring (variable subs, lags
+// only inside a sub) when the stream word decodes to a known RX-only decimation mode - see
+// qec_dec_mode(). Those statistics never mix with full-rate ones and never move the full-rate
+// model or the corrector: in a decimated session the solve is telemetry only.
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -44,6 +49,12 @@
 #define QEC_SLOT_STRIDE		4096
 #define QEC_PAYLOAD_OFF		256
 #define QEC_WRITER_GUARD	4		// stay this many slots behind rx_buf_id (in-flight VSPA DMA)
+#define QEC_DEC_MAX_SAMPLES	768		// bufdesc payload in use: 3 x 256 full-rate, <= 12 subs decimated
+
+// ring layouts this module understands (qec_state.mode)
+#define QEC_MODE_NONE		0
+#define QEC_MODE_NATIVE		1		// packed12, no DCS, no decimation: qec_slot_valid()
+#define QEC_MODE_DEC		0x100		// | rx_dcs << 4 | k: RX-only decimation 2^k, qec_dec_slot()
 
 void kernel_neon_begin(void);
 void kernel_neon_end(void);
@@ -146,6 +157,11 @@ static int dc_2x2_enable = 1;
 module_param(dc_2x2_enable, int, 0644);
 MODULE_PARM_DESC(dc_2x2_enable, "measured 2x2 stage when scalar stepping stalls (0 = scalar only)");
 
+// ---- decimated sessions -----------------------------------------------------------
+static int dec_enable = 1;
+module_param(dec_enable, int, 0644);
+MODULE_PARM_DESC(dec_enable, "sample decimated RX rings too (0 = native full rate only, as before)");
+
 // ---- TX QEC coefficient interface (host-driven cross-board cal) -----------------
 // The TX cal loop runs on a host: one board transmits, a second board measures, the host
 // solves and writes coefficients HERE (q20 fixed point, floats * 2^20). Writing 1 to
@@ -211,6 +227,11 @@ struct qec_state {
 	s32 m_eps, m_phi, m_tau, m_dcre, m_dcim;
 	u32 stat_slots, stat_solves, stat_dma_err, stat_idle;
 	u64 stat_proc_ns, stat_proc_slots;
+	// decimated sessions: mode = last active ring layout (QEC_MODE_*), dec_epoch = the
+	// fw RX stream generation the accumulator belongs to
+	int mode;
+	u32 dec_epoch;
+	u32 stat_dec_slots, stat_dec_rej, stat_dec_subs_skip;
 };
 
 static struct qec_state *qec;
@@ -478,6 +499,104 @@ static int qec_slot_valid(const u8 *slot) {
 	return 1;
 }
 
+// Which ring layout is live, decoded from the applied stream word (rfnm_la9310_get_clock_state,
+// the same decode hwinfo uses). Decimated = RX-only 2^k decimation: k 1..3 at rx_dcs 0, k 3..8 at
+// rx_dcs 1 (the rfnm_lalib RX ladder). Everything else is QEC_MODE_NONE: any TX in the plan (FDX
+// rung, concurrent TX+RX), and in particular rx_dcs=1 with k=0 - the TX+RX plan, whose
+// 256-sample subs run at a different rate and would otherwise pass for full-rate slots.
+static int qec_dec_mode(struct qec_state *st) {
+	extern void rfnm_la9310_get_clock_state(uint8_t *rx_dcs_div, uint8_t *tx_dcs_div, uint8_t *rx_decim_log2, uint8_t *tx_interp_log2);
+	extern uint64_t rfnm_tx_slot_rate_hz;
+	uint8_t rx_dcs, tx_dcs, k, tx_k;
+
+	rfnm_la9310_get_clock_state(&rx_dcs, &tx_dcs, &k, &tx_k);
+	if (tx_dcs || tx_k || rfnm_tx_slot_rate_hz || (st->status->tx_state & 1)) {
+		return QEC_MODE_NONE;
+	}
+	if (rx_dcs ? (k < 3 || k > 8) : (k < 1 || k > 3)) {
+		return QEC_MODE_NONE;
+	}
+	return QEC_MODE_DEC | (rx_dcs << 4) | k;
+}
+
+// Decimated slot -> accumulator (pattern: rfnm_agc agc_slot_stats). Sub sizes come from the
+// descriptors (multiple of 64, <= 256, <= 768 total, adc 0); subs from another fw stream
+// epoch or right after a re-gate (DISCONT) are skipped. Only the direct region (first
+// QEC_DIRECT_VALS/2 samples, bits[15:4] of each u16 - the same decode as qec_slot_scalar)
+// is used, and lags never cross a sub boundary: subs need not be contiguous in time.
+static int qec_dec_slot(struct qec_state *st, const u8 *slot) {
+	const struct rfnm_bufdesc_rx_sub *sub = (const struct rfnm_bufdesc_rx_sub *)slot;
+	const u16 *p = (const u16 *)(slot + QEC_PAYLOAD_OFF);
+	s16 *v = st->samp;
+	u32 sz[RFNM_RX_BUF_OUT_SUB_CNT], raw[RFNM_RX_BUF_OUT_SUB_CNT];
+	u32 nsamp = 0;
+	int off = 0, nsub = 0;
+	int s, k, m, used = 0;
+
+	// each descriptor is read ONCE (the ring is live shared memory; same pattern as the core
+	// reader, la9310_rfnm.c, incl. its reserved-bit reject) - the loop below uses the copies only
+	for (s = 0; s < RFNM_RX_BUF_OUT_SUB_CNT; s++) {
+		sz[s] = READ_ONCE(sub[s].size);
+		if (!sz[s]) {
+			break;
+		}
+		raw[s] = smp_load_acquire(&sub[s].adc_id);
+		if (RFNM_RX_SUBDESC_ID(raw[s]) != 0 || (raw[s] & ~0x00FF01FFu) || sz[s] > 256 || (sz[s] % 64)) {
+			st->stat_dec_rej++;
+			return 0;
+		}
+		nsamp += sz[s];
+		nsub++;
+	}
+	if (!nsamp || nsamp > QEC_DEC_MAX_SAMPLES) {
+		st->stat_dec_rej++;
+		return 0;
+	}
+
+	for (k = 0; k < QEC_DIRECT_VALS; k++) {
+		v[k] = (s16)(p[k] & 0xFFF0) >> 4;
+	}
+	for (s = 0; s < nsub; s++) {
+		int n = sz[s];
+
+		if (off >= QEC_DIRECT_VALS / 2) {
+			break;
+		}
+		if (off + n > QEC_DIRECT_VALS / 2) {
+			n = QEC_DIRECT_VALS / 2 - off;
+		}
+		if (RFNM_RX_SUBDESC_EPOCH(raw[s]) != st->dec_epoch || RFNM_RX_SUBDESC_DISCONT(raw[s])) {
+			st->stat_dec_subs_skip++;
+			off += sz[s];
+			continue;
+		}
+		for (k = 0; k < n; k++) {
+			st->acc.si += v[2 * (off + k)];
+			st->acc.sq += v[2 * (off + k) + 1];
+		}
+		for (m = 0; m < 4; m++) {
+			for (k = 0; k < n - m; k++) {
+				s64 i0 = v[2 * (off + k)];
+				s64 q0 = v[2 * (off + k) + 1];
+				s64 im = v[2 * (off + k + m)];
+				s64 qm = v[2 * (off + k + m) + 1];
+				st->acc.pii[m] += i0 * im;
+				st->acc.pqq[m] += q0 * qm;
+				st->acc.piq[m] += i0 * qm;
+				st->acc.pqi[m] += q0 * im;
+			}
+			st->acc.cnt[m] += n > m ? n - m : 0;
+		}
+		st->acc.n += n;
+		off += sz[s];
+		used = 1;
+	}
+	if (used) {
+		st->stat_dec_slots++;
+	}
+	return used;
+}
+
 // num/den in Q20 without overflowing the s64 shift: take what headroom num has, shift den for the rest
 static s64 qec_div_q20(s64 num, s64 den) {
 	int head = 62 - fls64((u64)(num < 0 ? -num : num) | 1);
@@ -577,12 +696,17 @@ static void qec_solve(struct qec_state *st) {
 		t_q20 = qec_div_q20(s_ib * s_rr2 - s_rb * s_ri, det);
 	}
 
+	if (st->mode != QEC_MODE_NATIVE) {
+		// decimated window: telemetry only, the full-rate model (and the corrector) is not ours to move
+		goto dec_done;
+	}
 	// damped model update; dc measured in 12-bit counts, normalized full scale = 2048
 	st->m_eps += (s32)((e_q20 * beta_q8) >> 8);
 	st->m_phi += (s32)((p_q20 * beta_q8) >> 8);
 	st->m_tau += (s32)((t_q20 * beta_q8) >> 8);
 	st->m_dcre -= (s32)((div64_s64(a->si << 20, (s64)a->n * 2048) * beta_q8) >> 8);
 	st->m_dcim -= (s32)((div64_s64(a->sq << 20, (s64)a->n * 2048) * beta_q8) >> 8);
+dec_done:
 	st->stat_solves++;
 
 	// analog drift alarm: the null went quiet but the mean walked out (temperature, slow
@@ -855,14 +979,61 @@ static void qec_poll(struct qec_state *st) {
 	int neon = use_neon;
 	{
 		/* QEC may only sample when the ring is in the exact state it understands:
-		 * packed12 fmt AND the native full-rate stream (no DCS mode, no decimation).
+		 * packed12 fmt AND the native full-rate stream (no DCS mode, no decimation),
+		 * or a decimated layout qec_dec_mode() decodes (below).
 		 * The fmt check alone was not enough: a killed local client leaves the VSPA
 		 * streaming its DCS/decim mode, QEC misparsed that ring and wrote runaway
 		 * corrections into the running stream (the 2026-07-03 repeated-open wedge). */
 		extern uint32_t rfnm_local_rx_fmt;
 		extern int rfnm_stream_is_native_rx(void);
-		if (rfnm_local_rx_fmt != 0 /* RFNM_PACKET_FMT_PACKED12 */ || !rfnm_stream_is_native_rx()) {
+		int mode = QEC_MODE_NONE;
+
+		if (rfnm_local_rx_fmt == 0 /* RFNM_PACKET_FMT_PACKED12 */ && rfnm_stream_is_native_rx()) {
+			mode = QEC_MODE_NATIVE;
+		} else if (dec_enable) {
+			/* Decimated sessions are keyed on the decoded stream word alone: the ring
+			 * holds the raw VSPA layout whatever fmt the client asked for (the CS16
+			 * unpack happens at copy-out, la9310_rfnm.c rfnm_local_fill_cs16). */
+			mode = qec_dec_mode(st);
+		}
+		if (mode == QEC_MODE_NONE) {
+			if (st->mode & QEC_MODE_DEC) {
+				st->mode = QEC_MODE_NONE;	// a later decimated session starts from a clean switch
+			}
 			return;
+		}
+		if (mode != st->mode && ((mode | st->mode) & QEC_MODE_DEC)) {
+			const char *from = st->mode & QEC_MODE_DEC ? "dec" : (st->mode ? "native" : "none");
+
+			// layout change into/out of/between decimated modes: never let a slot of
+			// one mode be accumulated as another; the clock plan moves the analog DC
+			st->settle_until = jiffies + msecs_to_jiffies(settle_ms);
+			memset(&st->acc, 0, sizeof(st->acc));
+			st->null_armed = 1;
+			st->null_iters = 0;
+			st->p_stage = 0;
+			st->null_floor = 0;
+			st->dec_epoch = st->status->rx_epoch & 0xFF;
+			if (mode == QEC_MODE_NATIVE) {
+				st->was_idle = 1;	// back at full rate: re-assert the model via the restart path below
+			}
+			if (verbose && (mode & QEC_MODE_DEC)) {
+				printk("rfnm_qec: ring mode %s -> dec dcs%d k%d\n", from, (mode >> 4) & 1, mode & 0xf);
+			} else if (verbose) {
+				printk("rfnm_qec: ring mode %s -> native\n", from);
+			}
+		}
+		st->mode = mode;
+		if (mode != QEC_MODE_NATIVE) {
+			u32 ep = st->status->rx_epoch & 0xFF;
+
+			// a new fw stream generation is a stream restart: re-settle, drop the window
+			if (ep != st->dec_epoch) {
+				st->dec_epoch = ep;
+				st->settle_until = jiffies + msecs_to_jiffies(settle_ms);
+				memset(&st->acc, 0, sizeof(st->acc));
+			}
+			neon = 0;
 		}
 	}
 
@@ -933,7 +1104,7 @@ static void qec_poll(struct qec_state *st) {
 	if (st->was_idle) {
 		st->was_idle = 0;
 		st->settle_until = jiffies + msecs_to_jiffies(settle_ms);
-		if (!st->corr_dead) {
+		if (!st->corr_dead && st->mode == QEC_MODE_NATIVE) {
 			qec_dma_write_params(st);
 		}
 	}
@@ -954,6 +1125,10 @@ static void qec_poll(struct qec_state *st) {
 	}
 	for (n = 0; n < avail; n++) {
 		const u8 *slot = st->ring + ((u64)((st->last_slot + 1 + n) % QEC_ADC_SLOT_CNT) * QEC_SLOT_STRIDE);
+		if (st->mode != QEC_MODE_NATIVE) {
+			qec_dec_slot(st, slot);
+			continue;
+		}
 		if (qec_slot_valid(slot)) {
 			if (neon) {
 				rfnm_qec_slot_neon((const u16 *)(slot + QEC_PAYLOAD_OFF), st->samp, &sums);
@@ -972,7 +1147,7 @@ static void qec_poll(struct qec_state *st) {
 
 	// the null runs first and owns the accumulator until it disarms: the estimator must
 	// never solve across the pre-null DC or a trim step
-	if (dc_null_enable && st->null_armed && !st->null_frozen) {
+	if (dc_null_enable && st->null_armed && !st->null_frozen && st->mode == QEC_MODE_NATIVE) {
 		if (st->acc.n >= (u64)dc_null_min_samples) {
 			qec_dc_null_step(st);
 		}
@@ -981,7 +1156,7 @@ static void qec_poll(struct qec_state *st) {
 
 	if (time_after(jiffies, st->last_solve + msecs_to_jiffies(solve_ms)) && st->acc.n >= (u64)min_samples) {
 		qec_solve(st);
-		if (!st->corr_dead) {
+		if (!st->corr_dead && st->mode == QEC_MODE_NATIVE) {
 			qec_dma_write_params(st);
 		}
 		st->last_solve = jiffies;
