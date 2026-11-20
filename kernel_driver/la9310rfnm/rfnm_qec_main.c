@@ -165,6 +165,17 @@ MODULE_PARM_DESC(dec_enable, "sample decimated RX rings too (0 = native full rat
 static int dec_dc_null;
 module_param(dec_dc_null, int, 0644);
 MODULE_PARM_DESC(dec_dc_null, "run the one-shot analog DCOFF null in decimated sessions too (needs dc_null_enable)");
+// eps/phi of decimated sessions go into their own model, written only to iq_comp_params2_rx_dec
+// and only at depths qec_dec_proven() lists. tau and dc stay the full-rate model's (frozen here).
+static int dec_iq;
+module_param(dec_iq, int, 0644);
+MODULE_PARM_DESC(dec_iq, "estimate eps/phi in decimated sessions and write them to the rx_dec corrector (0 = telemetry only)");
+static int dec_max_q20 = 104858;
+module_param(dec_max_q20, int, 0644);
+MODULE_PARM_DESC(dec_max_q20, "decimated model clamp |eps|,|phi|, Q20 (104858 = 0.1)");
+static int dec_step_q20 = 8192;
+module_param(dec_step_q20, int, 0644);
+MODULE_PARM_DESC(dec_step_q20, "decimated model max step per solve, Q20 (8192 = 0.0078)");
 
 // ---- TX QEC coefficient interface (host-driven cross-board cal) -----------------
 // The TX cal loop runs on a host: one board transmits, a second board measures, the host
@@ -236,6 +247,10 @@ struct qec_state {
 	int mode;
 	u32 dec_epoch;
 	u32 stat_dec_slots, stat_dec_rej, stat_dec_subs_skip;
+	// decimated model, Q20: seeded from m_eps/m_phi (what rx_dec holds) on every mode switch
+	s32 m_dec_eps, m_dec_phi;
+	int m_dec_ok;				// mode is a proven depth and the model is seeded
+	u32 stat_dec_solves, stat_dec_clamp;
 };
 
 static struct qec_state *qec;
@@ -330,6 +345,34 @@ static int qec_write_struct(struct qec_state *st, u32 dmem, u32 stage_off, s32 t
 	return qec_dma_xfer(st, dmem, (u32)QEC_STAGE_AXI + stage_off, 60, 0x000);
 }
 
+// qec_write_struct with the decimated model's eps/phi (tau and dc stay the full-rate model's)
+static int qec_dec_write_struct(struct qec_state *st, u32 dmem, u32 stage_off, s32 tau_q20) {
+	u32 ftaps_q20[12] = { 0 };
+	u32 i;
+	s32 h1_q20[5] = { 0 };
+	int k;
+
+	for (k = 0; k < 5; k++) {
+		h1_q20[k] = (s32)(((s64)tau_q20 * qec_d1_q20[k]) >> 20);
+	}
+	h1_q20[2] += (1 << 20) + st->m_dec_eps;
+
+	ftaps_q20[1] = -st->m_dec_phi;					// f2 = -tan(phi) ~ -phi
+	ftaps_q20[6] = 1 << 20;						// h2(2) = f1 = 1
+	for (k = 0; k < 5; k++) {
+		ftaps_q20[3 + 2 * (4 - k)] = h1_q20[k];			// h'1(k), descending k
+	}
+
+	for (i = 0; i < 12; i++) {
+		iowrite32(q20_to_f32((s32)ftaps_q20[i]), st->stage + stage_off + 4 * i);
+	}
+	iowrite32(5, st->stage + stage_off + 4 * 12);			// IQImb_delay = 2*D+1
+	iowrite32(q20_to_f32(st->m_dcre), st->stage + stage_off + 4 * 13);
+	iowrite32(q20_to_f32(st->m_dcim), st->stage + stage_off + 4 * 14);
+	wmb();
+	return qec_dma_xfer(st, dmem, (u32)QEC_STAGE_AXI + stage_off, 60, 0x000);
+}
+
 static int qec_dma_write_params(struct qec_state *st) {
 	int ret;
 
@@ -339,6 +382,9 @@ static int qec_dma_write_params(struct qec_state *st) {
 	}
 	// decimated paths: tau is per-sample, so it halves at 2x. 4x reuses the 2x taps (tau is
 	// ~3e-3 samples here, the residual stays below -60 dB either way)
+	if (dec_iq && st->m_dec_ok) {
+		return qec_dec_write_struct(st, QEC_PARAMS2_DEC_DMEM, 0x100, st->m_tau / 2);
+	}
 	return qec_write_struct(st, QEC_PARAMS2_DEC_DMEM, 0x100, st->m_tau / 2);
 }
 
@@ -523,6 +569,46 @@ static int qec_dec_mode(struct qec_state *st) {
 	return QEC_MODE_DEC | (rx_dcs << 4) | k;
 }
 
+// Depths where the stock fw was measured to apply iq_comp_params2_rx_dec to the ring samples
+// (0x2580 injection bench on RFNM Blue, 2026-11-20: k 1..3 at dcs0, k 3..6 at dcs1; 0x2600 has no
+// effect there). k 7/8 untested - dec_iq never writes eps/phi for them.
+static int qec_dec_proven(int mode) {
+	int dcs = (mode >> 4) & 1, k = mode & 0xf;
+
+	if (!(mode & QEC_MODE_DEC)) {
+		return 0;
+	}
+	return dcs ? (k >= 3 && k <= 6) : (k >= 1 && k <= 3);
+}
+
+// one damped step of the decimated model. Unlike the full-rate integrator it is bounded: an
+// implausible estimate is dropped, the step and the model are clamped - it must never run away
+// on a ring it misreads (the 2026-07-03 class)
+#define QEC_DEC_EST_MAX		(1 << 18)	// |estimate| above 0.25 is not an IQ imbalance
+static void qec_dec_update(struct qec_state *st, s64 e_q20, s64 p_q20) {
+	s64 mx = clamp(dec_max_q20, 0, QEC_DEC_EST_MAX);
+	s64 sx = clamp(dec_step_q20, 0, QEC_DEC_EST_MAX);
+	s64 de, dp;
+
+	if (!dec_iq || !st->m_dec_ok || st->corr_dead) {
+		return;				// telemetry only
+	}
+	if (e_q20 > QEC_DEC_EST_MAX || e_q20 < -QEC_DEC_EST_MAX || p_q20 > QEC_DEC_EST_MAX || p_q20 < -QEC_DEC_EST_MAX) {
+		st->stat_dec_clamp++;
+		return;
+	}
+	de = (e_q20 * beta_q8) >> 8;
+	dp = (p_q20 * beta_q8) >> 8;
+	if (de > sx || de < -sx || dp > sx || dp < -sx) {
+		st->stat_dec_clamp++;
+	}
+	de = clamp(de, -sx, sx);
+	dp = clamp(dp, -sx, sx);
+	st->m_dec_eps = (s32)clamp(st->m_dec_eps + de, -mx, mx);
+	st->m_dec_phi = (s32)clamp(st->m_dec_phi + dp, -mx, mx);
+	st->stat_dec_solves++;
+}
+
 // Decimated slot -> accumulator (pattern: rfnm_agc agc_slot_stats). Sub sizes come from the
 // descriptors (multiple of 64, <= 256, <= 768 total, adc 0); subs from another fw stream
 // epoch or right after a re-gate (DISCONT) are skipped. Only the direct region (first
@@ -698,6 +784,7 @@ static void qec_solve(struct qec_state *st) {
 
 	if (st->mode != QEC_MODE_NATIVE) {
 		// decimated window: the full-rate model (0x2600, and the dc/tau terms) is not ours to move
+		qec_dec_update(st, e_q20, p_q20);
 		goto dec_done;
 	}
 	// damped model update; dc measured in 12-bit counts, normalized full scale = 2048
@@ -1009,6 +1096,12 @@ static void qec_poll(struct qec_state *st) {
 			st->p_stage = 0;
 			st->null_floor = 0;
 			st->dec_epoch = st->status->rx_epoch & 0xFF;
+			// rx_dec holds the full-rate eps/phi until we write ours: seed from there, and
+			// let the restart path below re-assert whichever model now owns rx_dec
+			st->m_dec_eps = st->m_eps;
+			st->m_dec_phi = st->m_phi;
+			st->m_dec_ok = qec_dec_proven(mode);
+			st->was_idle = 1;
 			if (verbose) {
 				printk("rfnm_qec: ring mode %s -> %s dcs%d k%d\n", st->mode & QEC_MODE_DEC ? "dec" : (st->mode ? "native" : "none"),
 					mode & QEC_MODE_DEC ? "dec" : "native", (mode >> 4) & 1, mode & 0xf);
