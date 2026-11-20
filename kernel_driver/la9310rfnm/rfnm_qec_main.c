@@ -1107,10 +1107,16 @@ static void qec_dc_null_step(struct qec_state *st) {
 	}
 	if(st->mode != QEC_MODE_NATIVE) {
 		// decimated sessions always run under an app trim (lorad/adsld 10/24): probe from the
-		// live codes, not from the mirror of what this module last wrote
+		// live codes, not from the mirror of what this module last wrote.
+		// Except the all-zero pair: it is skip-write by wire contract, yet the chlist
+		// apply still memcpy's it into rx_ch - any client apply carrying 0/0 (every
+		// librfnm client that opened while the field read 0/0, incl. its channel-off
+		// apply at close) zeroes the echoed field while the silicon keeps the standing
+		// codes. Probing from 0/0 then mixes the stale codes into the first J column
+		// (2026-11-20: J=[35 -9; -3 0], 3 solves to the clamp, DC worse than before).
 		struct rfnm_dgb *d = rfnm_dgb_get(st->dgb_id);
 
-		if(d && d->rx_ch[st->ch_id]) {
+		if(d && d->rx_ch[st->ch_id] && (d->rx_ch[st->ch_id]->rfic_dc_i || d->rx_ch[st->ch_id]->rfic_dc_q)) {
 			st->trim_i = d->rx_ch[st->ch_id]->rfic_dc_i;
 			st->trim_q = d->rx_ch[st->ch_id]->rfic_dc_q;
 		}
