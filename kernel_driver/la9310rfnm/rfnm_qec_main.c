@@ -22,8 +22,11 @@
 // ring (variable subs, lags only inside a sub) when the stream word decodes to a known
 // RX-only decimation mode - see qec_dec_mode(). Those statistics never mix with full-rate
 // ones, and their eps/phi go into a separate model (m_dec_*) that only ever reaches
-// iq_comp_params2_rx_dec, and only at depths a bench proved the fw applies it. With the
-// defaults (dec_dc_null=0, dec_iq=0) a decimated session is read-only: no DMA, no trim.
+// iq_comp_params2_rx_dec, and only at depths a bench proved the fw applies it. Defaults:
+// dec_dc_null=1 (the analog DC null runs in decimated sessions; RFNM .124 2026-11-20: 2 MSps
+// DC -24 -> -37..-50 dBFS, lorad unchanged or better) and dec_iq=0 (eps/phi telemetry only, no
+// DMA: on real 2 MSps signals the lag regression estimates phi ~0.4-0.9 rad against a measured
+// residual of ~0.025, so every update would be rejected - not usable yet).
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -166,9 +169,9 @@ MODULE_PARM_DESC(dc_2x2_enable, "measured 2x2 stage when scalar stepping stalls 
 static int dec_enable = 1;
 module_param(dec_enable, int, 0644);
 MODULE_PARM_DESC(dec_enable, "sample decimated RX rings too (0 = native full rate only, as before)");
-static int dec_dc_null;
+static int dec_dc_null = 1;
 module_param(dec_dc_null, int, 0644);
-MODULE_PARM_DESC(dec_dc_null, "run the one-shot analog DCOFF null in decimated sessions too (needs dc_null_enable)");
+MODULE_PARM_DESC(dec_dc_null, "run the one-shot analog DCOFF null in decimated sessions too (needs dc_null_enable; 0 = leave the app trim alone)");
 // eps/phi of decimated sessions go into their own model, written only to iq_comp_params2_rx_dec
 // and only at depths qec_dec_proven() lists. tau and dc stay the full-rate model's (frozen here).
 static int dec_iq;
