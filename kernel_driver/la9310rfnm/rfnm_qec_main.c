@@ -175,7 +175,8 @@ module_param(dec_dc_null, int, 0644);
 MODULE_PARM_DESC(dec_dc_null, "run the one-shot analog DCOFF null in decimated sessions too (needs dc_null_enable; 0 = leave the app trim alone)");
 // eps/phi of decimated sessions go into their own model, written only to iq_comp_params2_rx_dec
 // and only at depths qec_dec_proven() lists. tau and dc stay the full-rate model's (frozen here).
-static int dec_iq;
+// On by default since the on-board sign test + A/B on .124 (2026-11-21, doc/rfnm_qec_decimated.txt).
+static int dec_iq = 1;
 module_param(dec_iq, int, 0644);
 MODULE_PARM_DESC(dec_iq, "estimate eps/phi in decimated sessions and write them to the rx_dec corrector (0 = telemetry only, no writes); learns only while |mean| <= dc_renull_counts, i.e. needs dec_dc_null or a good app trim");
 static int dec_max_q20 = 52429;

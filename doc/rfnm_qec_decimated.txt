@@ -20,8 +20,8 @@ This branch adds, only in kernel_driver/la9310rfnm/rfnm_qec_main.c:
       dec_enable=1    sample decimated rings (0 = stock behaviour)
       dec_dc_null=1   run the analog DCOFF null in decimated sessions, starting from the
                       live rfic_dc_i/q codes
-      dec_iq=0        eps/phi model for rx_dec (seed-relative clamp, divergence latch).
-                      Keep 0 until the on-board sign test (below) passed.
+      dec_iq=1        eps/phi model for rx_dec (seed-relative clamp, divergence latch).
+                      Default 1 since the on-board sign test + A/B (below) passed.
       dec_max_q20=52429, dec_step_q20=8192   dec_iq clamp / step
   With dec_iq=0 no DMA write happens in a decimated session (read-only + analog trim).
 
@@ -62,7 +62,7 @@ Host tests: notes rfnm-qec-open-2026-11-21/a1 (t3 = estimator on captures, t4 = 
 with simulated rx_dec, correct and flipped sign; review/ t5 = t4 + beta, reseed target and
 failed-release knobs).
 
-On-board sign test (not run yet; RX only, radio released, debug build = this branch +
+On-board sign test (run 2026-11-21, results below; RX only, radio released, debug build = this branch +
 rfnm-qec-dec-2026-11-20/debug/rfnm_qec_dbg.patch, dec_iq=0, verbose=1):
   1. 2 MSps session (rfnmiq 869.368 MHz gain 30 sma_a agc 0, ~60 s): >= 4 'est(uQ20)' lines -> E_off
   2. dbg_dcre_q20=0 dbg_dcim_q20=0 dbg_target=0 dbg_mode=1 (0x2580 := eps +0.05 phi +0.05) -> E_on
@@ -71,6 +71,21 @@ rfnm-qec-dec-2026-11-20/debug/rfnm_qec_dbg.patch, dec_iq=0, verbose=1):
   2026-11-20 injection captures: -0.046..-0.051). Positive delta = flipped chain: leave dec_iq 0.
   4. After PASS, candidate module, dec_iq=1 in a lorad session: 'dec model' converges to E_off
   in ~10 solves, no 'diverging'; cs16 capture after: |rho| < 0.005, IRR_coh rises.
+
+Measured on .124 (2026-11-21 night, 2 MSps dcs1 k5, gain 30, sma_a, analog DC null on):
+  Sign test (debug build, plain load = zero model in 0x2580, 869.368 MHz, one 370 s session):
+    E_off eps +0.0211 phi +0.0311, E_on -0.0274/-0.0166, E_off2 +0.0190/+0.0323 ->
+    E_on - E_off = -0.0485/-0.0477 (-0.0464/-0.0489 vs E_off2) for the +0.05/+0.05 step: PASS.
+  dec_iq=1 (module with the insmod model seed, fresh insmod), lorad 16 min then adsld 16 min:
+    dec model eps -2136 -> ~23600, phi 22344 -> ~33800 uQ20 in ~10 solves, residual est |.| <
+    ~5000 after that, 80 solves, 0 clamp, 0 hold, no 'diverging', dmaerr 0.
+  10 s captures, same boot and module, dec_iq=0 vs 1 (qec_ab.py g/rho, IRR_coh):
+    869.368  36.7 -> 51.6 dB, g -0.23 -> -0.00 dB, rho +0.0082 -> +0.0013
+    869.618  36.8 -> 52.5 dB, g -0.19 -> +0.03 dB, rho +0.0099 -> +0.0012
+    867.900  36.3 -> 55.2 dB, g -0.23 -> +0.02 dB, rho +0.0134 -> -0.0001
+  DC unchanged (-50.5..-51.0 dBFS). dec_iq 1 -> 0 at runtime hands rx_dec back (IRR back to 36.x).
+  The decimated model is not saved across a reboot: after a boot it relearns from the seed in
+  ~10 solves (~4 min of a 2 MSps session).
 
 Build (host, matches the deployed vermagic 6.6.36-rt35-ga13146252326)
 -----------------------------------------------------------------------
