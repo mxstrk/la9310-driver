@@ -21,7 +21,9 @@
 // Decimated sessions: the same estimator also runs on the decimated ring (variable subs, lags
 // only inside a sub) when the stream word decodes to a known RX-only decimation mode - see
 // qec_dec_mode(). Those statistics never mix with full-rate ones and never move the full-rate
-// model or the corrector: in a decimated session the solve is telemetry only.
+// model or the corrector: in a decimated session the solve is telemetry only. The analog DC
+// null does run there (dec_dc_null, default on): RFNM Blue 2026-11-20, 2 MSps: DC -25.6 dBFS
+// under the app trim -> -37..-53 dBFS.
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -161,6 +163,9 @@ MODULE_PARM_DESC(dc_2x2_enable, "measured 2x2 stage when scalar stepping stalls 
 static int dec_enable = 1;
 module_param(dec_enable, int, 0644);
 MODULE_PARM_DESC(dec_enable, "sample decimated RX rings too (0 = native full rate only, as before)");
+static int dec_dc_null = 1;
+module_param(dec_dc_null, int, 0644);
+MODULE_PARM_DESC(dec_dc_null, "run the one-shot analog DCOFF null in decimated sessions too (needs dc_null_enable; 0 = leave the app trim alone)");
 
 // ---- TX QEC coefficient interface (host-driven cross-board cal) -----------------
 // The TX cal loop runs on a host: one board transmits, a second board measures, the host
@@ -955,6 +960,16 @@ static void qec_dc_null_step(struct qec_state *st) {
 	if(qec_find_target(st)) {
 		goto out;	// no dgb yet: stay armed, retry on the next window
 	}
+	if(st->mode != QEC_MODE_NATIVE) {
+		// decimated sessions run under an app trim (rfic_dc_i/q set by the client): probe
+		// from the live codes, not from the mirror of what this module last wrote
+		struct rfnm_dgb *d = rfnm_dgb_get(st->dgb_id);
+
+		if(d && d->rx_ch[st->ch_id]) {
+			st->trim_i = d->rx_ch[st->ch_id]->rfic_dc_i;
+			st->trim_q = d->rx_ch[st->ch_id]->rfic_dc_q;
+		}
+	}
 
 	// the measured 2x2 is the ONLY stage: the per-session
 	// bring-up lottery means NO region of the code space may assume an aligned per-lane
@@ -1147,7 +1162,7 @@ static void qec_poll(struct qec_state *st) {
 
 	// the null runs first and owns the accumulator until it disarms: the estimator must
 	// never solve across the pre-null DC or a trim step
-	if (dc_null_enable && st->null_armed && !st->null_frozen && st->mode == QEC_MODE_NATIVE) {
+	if (dc_null_enable && st->null_armed && !st->null_frozen && (st->mode == QEC_MODE_NATIVE || dec_dc_null)) {
 		if (st->acc.n >= (u64)dc_null_min_samples) {
 			qec_dc_null_step(st);
 		}
