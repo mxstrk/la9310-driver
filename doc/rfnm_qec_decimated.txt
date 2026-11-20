@@ -38,17 +38,29 @@ Decimated windows now estimate from the first difference x(n)-x(n-1) (lag 0 minu
 tau pinned to the full-rate model:
     eps = (rc0 - rc1) / (ra0 - ra1),   phi = (ic0 - ic1) / (ra0 - ra1)
 (a filter applied to both rails leaves eps/phi unchanged; the difference cancels the slow part).
-Held when ra0 - ra1 < ra0/16 (no power off DC). Offline, integer port on 41 real captures:
+Held unless 0 < ra0 - ra1 and 16 (ra0 - ra1) > ra0 (no power off DC). Offline, integer port on 41 real captures:
 1-8 MSps (dcs1 k3-k6, 29 captures): phi 29/29 and eps 28/29 within 20 % (or 0.003) of the
 qec_ab.py g/rho, and the 0x2580 +0.05/+0.05 injection reads as -0.046..-0.051 on both (right
 sign for the integrator). 15-61 MSps (dcs0): 8 of 12 off (ambient bursts rule the window
 means), so dcs0 depths stay telemetry-only.
-Also: dec_iq writes nothing to 0x2580 before its first accepted update (rx_dec keeps the
-full-rate model till then); the decimated model is reseeded (learned offset kept) when the
-full-rate model moved since its seed; the divergence latch needs |est| > 4e-3 and a growth by
-more than 4e-3 per solve (window noise ~1.5e-3 tripped the old 1e-3 latch in a correct loop).
+A residual skew tau_r in rx_dec (it runs m_tau >> k) leaks into phi as about tau_r*sin(w)
+for a tone at w, i.e. at most |tau_r|, a fraction of m_tau (~3e-3): ignored (not measured).
+Also: dec_iq writes nothing to 0x2580 before its first accepted update at a depth (rx_dec
+keeps the full-rate model till then). "Accepted" is per depth, not per enable: dec_learned
+survives dec_iq 1->0->1 and a native session in between, so re-enabling dec_iq re-asserts the
+stored learned model at once; insmod fresh (or reboot) for a clean start, e.g. before a test.
+When the full-rate model moved since the seed, the seed is recentred on it; a learned
+decimated model stays absolute (clamped to the new seed +- dec_max_q20), an unlearned one
+follows the full-rate model.
+Divergence latch (QEC_DEC_DIVERGE = 3 solves in a row): either the residual has the same sign,
+is above 4e-3 and grew by more than 4e-3 since the last solve (window noise ~1.5e-3 tripped
+the old 1e-3 latch in a correct loop), or the model sits at its seed +- dec_max_q20 clamp edge
+and the estimate still pushes outward (a flipped chain that stopped growing at the clamp:
+low beta_q8, or a small start residual). If the release write to 0x2580 fails, rx_dec stays
+owned and the next solve retries the full-rate model.
 Host tests: notes rfnm-qec-open-2026-11-21/a1 (t3 = estimator on captures, t4 = closed loop
-with simulated rx_dec, correct and flipped sign).
+with simulated rx_dec, correct and flipped sign; review/ t5 = t4 + beta, reseed target and
+failed-release knobs).
 
 On-board sign test (not run yet; RX only, radio released, debug build = this branch +
 rfnm-qec-dec-2026-11-20/debug/rfnm_qec_dbg.patch, dec_iq=0, verbose=1):

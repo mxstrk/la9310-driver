@@ -604,6 +604,13 @@ static int qec_dec_proven(int mode) {
 	return dcs ? (k >= 3 && k <= 6) : (k >= 1 && k <= 3);
 }
 
+// Depths where dec_iq may learn eps/phi: dcs1 (k3-6, 8-1 MSps) only. At dcs0 (k1-3, 15-61 MSps)
+// ambient bursts rule the window means, the estimate missed the measured residual on 8 of 12
+// captures - telemetry only there, although qec_dec_proven() lists those depths for the writer.
+static int qec_dec_learns(int mode) {
+	return qec_dec_proven(mode) && ((mode >> 4) & 1);
+}
+
 // divergence latch input: a same-sign residual above the noise floor that grew since the last
 // solve by more than the floor again (each step went its way, so a converging loop must have
 // shrunk it; the margin keeps window noise from tripping it while the loop still converges)
@@ -612,6 +619,14 @@ static int qec_dec_grew(s64 est, s64 *last) {
 
 	*last = est;
 	return grew;
+}
+
+// second latch input: the model sits at its seed-relative clamp edge and the estimate still
+// pushes it outward. A converging loop never does (its target lies inside the clamp); a
+// flipped chain ends there and stops growing, which the growth test above cannot see (low
+// beta_q8, or a residual that started below the floor)
+static int qec_dec_pinned(s64 n, s64 step, s64 seed, s64 mx) {
+	return mx && ((step > 0 && n >= seed + mx) || (step < 0 && n <= seed - mx));
 }
 
 // one damped step of the decimated model. Unlike the full-rate integrator it is bounded: an
@@ -626,12 +641,10 @@ static void qec_dec_update(struct qec_state *st, s64 e_q20, s64 p_q20, s64 dom) 
 	s64 de, dp, ne, np;
 	int grew;
 
-	if (!dec_iq || !st->m_dec_ok || st->corr_dead) {
+	if (!dec_iq || !st->m_dec_ok || st->corr_dead || st->dec_div) {
 		return;				// telemetry only
 	}
-	if (!((st->m_dec_mode >> 4) & 1)) {
-		// dcs0 (k1-3, 15-61 MSps): ambient bursts rule the window means there, the estimate
-		// missed the measured residual on 8 of 12 captures - telemetry only there
+	if (!qec_dec_learns(st->m_dec_mode)) {
 		return;
 	}
 	if (dom > dc_renull_counts) {
@@ -653,6 +666,7 @@ static void qec_dec_update(struct qec_state *st, s64 e_q20, s64 p_q20, s64 dom) 
 	np = clamp(st->m_dec_phi + dp, st->m_dec_phi0 - mx, st->m_dec_phi0 + mx);
 	grew = qec_dec_grew(e_q20, &st->dec_e_last);
 	grew |= qec_dec_grew(p_q20, &st->dec_p_last);
+	grew |= qec_dec_pinned(ne, de, st->m_dec_eps0, mx) || qec_dec_pinned(np, dp, st->m_dec_phi0, mx);
 	st->dec_grow = grew ? st->dec_grow + 1 : 0;
 	if (st->dec_grow >= QEC_DEC_DIVERGE) {
 		printk("rfnm_qec: dec model diverging at dcs%d k%d (est eps=%lld phi=%lld, model eps=%d phi=%d) - seed restored, dec_iq off at this depth\n",
@@ -662,6 +676,12 @@ static void qec_dec_update(struct qec_state *st, s64 e_q20, s64 p_q20, s64 dom) 
 		st->dec_learned = 0;
 		st->dec_div = 1;
 		qec_dec_release(st);
+		if (st->dec_written) {
+			// the release write failed (dmaerr): keep rx_dec ours, so the next solve's
+			// qec_dma_write_params retries the full-rate model (dec_learned is 0 now)
+			st->m_dec_ok = 1;
+			printk("rfnm_qec: dec seed restore failed, retrying\n");
+		}
 		return;
 	}
 	st->m_dec_eps = (s32)ne;
@@ -796,9 +816,11 @@ static void qec_solve(struct qec_state *st) {
 		// phi 0.4-0.9; the difference cancels it and matches the measured residual g/rho
 		// (2026-11-21, 29 real captures at 1-8 MSps: phi 29, eps 28 within 20 % or 0.003, and the
 		// sign of an injected 0x2580 step). Any filter applied to both rails keeps eps/phi.
+		// A residual skew tau_r (rx_dec runs m_tau >> k) leaks into phi as tau_r*(iap0-iap1)/d,
+		// i.e. ~tau_r*sin(w) for a tone at w: at most |tau_r|, a fraction of m_tau (~3e-3) - ignored.
 		s64 d = ra[0] - ra[1];
 
-		if ((d << 4) > ra[0]) {		// enough power off DC to estimate from
+		if (d > 0 && d * 16 > ra[0]) {	// enough power off DC to estimate from
 			e_q20 = qec_div_q20(rc[0] - rc[1], d);
 			p_q20 = qec_div_q20(ic[0] - ic[1], d);
 			qec_dec_update(st, e_q20, p_q20, max(abs(mi_q8 >> 8), abs(mq_q8 >> 8)));
@@ -903,7 +925,7 @@ dec_done:
 			// decimated window (scalar parser): the line above carries est and the full-rate model
 			printk("rfnm_qec: dec dcs%d k%d | dec slots %u rej %u subskip %u | dec model eps=%d phi=%d (%s%s) solves %u clamp %u hold %u | mean=(%lld,%lld) codes=(%d,%d) null %s\n",
 				(st->mode >> 4) & 1, st->mode & 0xf, st->stat_dec_slots, st->stat_dec_rej, st->stat_dec_subs_skip,
-				st->m_dec_eps, st->m_dec_phi, st->dec_div ? "diverged" : (!st->m_dec_ok ? "unproven depth" : (dec_iq && !st->corr_dead && ((st->m_dec_mode >> 4) & 1) ? "live" : "telemetry")),
+				st->m_dec_eps, st->m_dec_phi, st->dec_div ? "diverged" : (!st->m_dec_ok ? "unproven depth" : (dec_iq && !st->corr_dead && qec_dec_learns(st->m_dec_mode) ? "live" : "telemetry")),
 				st->dec_written ? ", in rx_dec" : "",
 				st->stat_dec_solves, st->stat_dec_clamp, st->stat_dec_hold, mi_q8 >> 8, mq_q8 >> 8, st->trim_i, st->trim_q,
 				!(dc_null_enable && dec_dc_null) ? "off" : (st->null_frozen ? "frozen" : (st->null_armed ? "armed" : "quiet")));
@@ -1216,10 +1238,18 @@ static void qec_poll(struct qec_state *st) {
 				st->dec_learned = 0;
 			} else if ((mode & QEC_MODE_DEC) && (st->m_eps != st->m_dec_eps0 || st->m_phi != st->m_dec_phi0)) {
 				// the full-rate model moved since the seed (a native session in between, or the
-				// seed predates the first native solve): reseed, keeping what this depth learned
-				// on top of it - the clamp stays relative to the seed
-				st->m_dec_eps += st->m_eps - st->m_dec_eps0;
-				st->m_dec_phi += st->m_phi - st->m_dec_phi0;
+				// seed predates the first native solve): recentre the seed. A learned model is
+				// absolute (it was measured on this depth's ring) and stays, clamped to the new
+				// seed's window; one that never learned follows the full-rate model
+				s64 mx = clamp(dec_max_q20, 0, QEC_DEC_EST_MAX);
+
+				if (st->dec_learned) {
+					st->m_dec_eps = clamp((s64)st->m_dec_eps, (s64)st->m_eps - mx, (s64)st->m_eps + mx);
+					st->m_dec_phi = clamp((s64)st->m_dec_phi, (s64)st->m_phi - mx, (s64)st->m_phi + mx);
+				} else {
+					st->m_dec_eps = st->m_eps;
+					st->m_dec_phi = st->m_phi;
+				}
 				st->m_dec_eps0 = st->m_eps;
 				st->m_dec_phi0 = st->m_phi;
 				st->dec_e_last = 0;
