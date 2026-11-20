@@ -820,6 +820,14 @@ dec_done:
 			a->n, e_q20, p_q20, t_q20, st->m_eps, st->m_phi, st->m_tau, st->m_dcre, st->m_dcim,
 			st->stat_slots, st->stat_solves, st->stat_dma_err, st->stat_idle,
 			st->stat_proc_slots ? st->stat_proc_ns / st->stat_proc_slots : 0, use_neon ? "neon" : "scalar");
+		if (st->mode != QEC_MODE_NATIVE) {
+			// decimated window (scalar parser): the line above carries est and the full-rate model
+			printk("rfnm_qec: dec dcs%d k%d | dec slots %u rej %u subskip %u | dec model eps=%d phi=%d (%s) solves %u clamp %u | mean=(%lld,%lld) codes=(%d,%d) null %s\n",
+				(st->mode >> 4) & 1, st->mode & 0xf, st->stat_dec_slots, st->stat_dec_rej, st->stat_dec_subs_skip,
+				st->m_dec_eps, st->m_dec_phi, !st->m_dec_ok ? "unproven depth" : (dec_iq && !st->corr_dead ? "live" : "telemetry"),
+				st->stat_dec_solves, st->stat_dec_clamp, mi_q8 >> 8, mq_q8 >> 8, st->trim_i, st->trim_q,
+				!(dc_null_enable && dec_dc_null) ? "off" : (st->null_frozen ? "frozen" : (st->null_armed ? "armed" : "quiet")));
+		}
 		st->stat_proc_ns = 0;
 		st->stat_proc_slots = 0;
 	}
