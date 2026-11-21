@@ -1,6 +1,33 @@
 rfnm_qec in decimated RX sessions (branch qec-decimated, 2026-11-20)
 ====================================================================
 
+Deployed on RFNM Blue .124 (status 2026-11-21 02:20 CET)
+-------------------------------------------------------
+  /rfnm/kernel/rfnm_qec.ko  md5 6135e5bcfbb7ede90c5ee24ac7b78f57 = branch qec-dec-iq-boot f60e73a
+      (qec-boot-model fd5d26d + qec-dec-iq 2cf3657), build_qec.sh, two builds identical.
+  Loaded params: dec_enable=1 dec_dc_null=1 dec_iq=1 + insmod seed from /rfnm/calib/rfnm_qec.model
+      (init_eps_q20=-2136 init_phi_q20=22344 init_tau_q20=16819, learned 2026-11-20 native).
+  Board side: /rfnm/scripts/load_drivers md5 183ef6ae (seeded insmod with fallback),
+      /rfnm/scripts/qec_model_save 1f744963, rfnm-qec-model-save.timer enabled (30 min).
+  Backups on the board (newest first):
+      rfnm_qec.ko.prev-20261121b  f6a8ca63  qec-boot-model fd5d26d (dec_iq=0, seed)
+      rfnm_qec.ko.prev-20261121   c8f391e6  qec-decimated 8b44d79 (dec_iq=0, no seed)
+      rfnm_qec.ko.stock / .prev-20261120  bacabcc0  stock a564201
+      load_drivers.prev-20261121  f8e7aa0d  (plain insmod)
+  Each step is recorded in /rfnm/STACK_MANIFEST.
+  Rollback one step (radio free, no reboot, core modules untouched):
+      curl -X POST -H 'Content-Type: application/json' -d '{"owner":"none"}' localhost/api/v1/radio
+      rmmod rfnm_qec
+      cp /rfnm/kernel/rfnm_qec.ko.prev-20261121b /rfnm/kernel/rfnm_qec.ko
+      insmod /rfnm/kernel/rfnm_qec.ko $(cat /rfnm/calib/rfnm_qec.model)
+  Quick off-switch at runtime: echo 0 > /sys/module/rfnm_qec/parameters/dec_iq
+  A/B stock (bacabcc0) vs this module, 8 x 15.3 min lorad meshcore 869.618 MHz against a Heltec
+  reference (2026-11-21 00:13-02:17): no significant reception difference (crc-ok/Heltec
+  0.796 vs 0.749, p=0.57); resolution about +-20 %. No regression, no measurable gain.
+  Not yet observed: a boot with exactly this module (boot path identical to f6a8ca63, which
+  was reboot-tested). The decimated model is not persisted (relearns ~4 min per boot).
+  Not in this module: the qec-sysfs-dc fix (99b499e, decimated null start when rfic_dc reads 0/0).
+
 What changed
 ------------
 Stock rfnm_qec only samples the native 122.88 MSps ring (qec_poll bails out unless
